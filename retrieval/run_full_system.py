@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 from transformers import BertTokenizerFast
 
 sys.path.insert(0, str(Path(__file__).parent))
