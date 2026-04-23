@@ -35,14 +35,11 @@ Output:
 """
 
 import argparse
-import pickle
 import sys
 import time
-from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +65,14 @@ EVAL_EVERY  = 200
 MAX_LEN_AB  = 256        # max tokens for [CLS] A [SEP] B [SEP]
 MAX_LEN_C   = 128        # max tokens for standalone C encoding
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Loss weights — three-component IB-inspired objective
+# L_content:    complement must encode B's information  (prevents collapse)
+# L_orthogonal: complement must NOT encode A's information  (prevents shortcut)
+# L_chain:      complement must point toward C  (chain supervision)
+LAMBDA_CONTENT    = 1.0
+LAMBDA_ORTHOGONAL = 0.3
+LAMBDA_CHAIN      = 0.5
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -160,15 +165,22 @@ def mean_pool(tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
 
 class ChainContrastiveLoss(nn.Module):
     """
-    C-anchor contrastive loss for query-agnostic complement training.
+    Three-component IB-inspired loss for query-agnostic complement training.
 
-    For each directed hop (A → B_pos) with known next-hop C:
-        score_pos = cos_sim( mean_pool(complement(A, B_pos)), pool_C )
-        score_neg = cos_sim( mean_pool(complement(A, B_neg)), pool_C )
-        loss      = mean( relu( margin + score_neg - score_pos ) )
+    L_content:    1 - cos(complement(A,B_pos), standalone_B)
+                  Forces complement to encode B's information.
+                  Prevents the model from collapsing to a zero/random vector.
 
-    The complement of (A → B_pos) should "point toward" C:
-    it captures the information that continues the reasoning chain.
+    L_orthogonal: |cos(complement(A,B_pos), standalone_A)|
+                  Forces complement to differ from A.
+                  Prevents the shortcut of ignoring A and just encoding B.
+
+    L_chain:      C-anchor margin loss — complement(A,B_pos) closer to C
+                  than complement(A,B_neg). Chain supervision signal.
+
+    Total: LAMBDA_CONTENT * L_content
+         + LAMBDA_ORTHOGONAL * L_orthogonal
+         + LAMBDA_CHAIN * L_chain
     """
 
     def __init__(self, margin: float = MARGIN):
@@ -177,25 +189,42 @@ class ChainContrastiveLoss(nn.Module):
 
     def forward(
         self,
-        complement_pos:  torch.Tensor,   # [B, n_pos, 128]
-        b_pad_mask_pos:  torch.Tensor,   # [B, n_pos] bool
+        complement_pos:  torch.Tensor,        # [B, n_pos, 128]
+        b_pad_mask_pos:  torch.Tensor,        # [B, n_pos] bool
         complement_negs: List[torch.Tensor],  # each [B, n_neg, 128]
         b_pad_masks_neg: List[torch.Tensor],  # each [B, n_neg] bool
-        pool_c:          torch.Tensor,   # [B, 128]  C's pooled representation
+        pool_c:          torch.Tensor,        # [n_c, 128]  standalone C (only rows where has_c)
+        pool_a:          torch.Tensor,        # [B, 128]  standalone A
+        pool_b:          torch.Tensor,        # [B, 128]  standalone B_pos
+        has_c:           torch.Tensor,        # [B] bool — True when C is available
     ) -> torch.Tensor:
 
-        pool_pos   = mean_pool(complement_pos, b_pad_mask_pos)    # [B, 128]
-        score_pos  = (pool_pos * pool_c).sum(-1)                  # [B]
+        pool_pos = mean_pool(complement_pos, b_pad_mask_pos)   # [B, 128]
 
-        loss = torch.zeros(1, device=complement_pos.device, requires_grad=False)
-        count = 0
-        for comp_neg, mask_neg in zip(complement_negs, b_pad_masks_neg):
-            pool_neg  = mean_pool(comp_neg, mask_neg)             # [B, 128]
-            score_neg = (pool_neg * pool_c).sum(-1)               # [B]
-            loss = loss + F.relu(self.margin + score_neg - score_pos).mean()
-            count += 1
+        # L_content: complement must encode B's content
+        l_content = (1.0 - (pool_pos * pool_b).sum(-1)).mean()
 
-        return loss / max(count, 1)
+        # L_orthogonal: complement must NOT encode A's content
+        l_orthogonal = (pool_pos * pool_a).sum(-1).abs().mean()
+
+        # L_chain: C-anchor margin ranking loss — only for examples that have C
+        if pool_c is not None and has_c.any():
+            pool_pos_c = pool_pos[has_c]                       # [n_c, 128]
+            score_pos  = (pool_pos_c * pool_c).sum(-1)         # [n_c]
+            l_chain = torch.zeros(1, device=complement_pos.device)
+            count = 0
+            for comp_neg, mask_neg in zip(complement_negs, b_pad_masks_neg):
+                pool_neg_c = mean_pool(comp_neg, mask_neg)[has_c]   # [n_c, 128]
+                score_neg  = (pool_neg_c * pool_c).sum(-1)           # [n_c]
+                l_chain    = l_chain + F.relu(self.margin + score_neg - score_pos).mean()
+                count += 1
+            l_chain = l_chain / max(count, 1)
+        else:
+            l_chain = torch.zeros(1, device=complement_pos.device)
+
+        return (LAMBDA_CONTENT    * l_content
+              + LAMBDA_ORTHOGONAL * l_orthogonal
+              + LAMBDA_CHAIN      * l_chain)
 
 
 # ── Tokenizer helpers ──────────────────────────────────────────────────────────
@@ -249,21 +278,24 @@ class ChainDataset(Dataset):
     """
 
     def __init__(self, quadruples: List[Dict], id_to_text: Dict[str, str]):
-        self.data      = [q for q in quadruples if q.get("chunk_c_id") is not None]
+        self.data       = quadruples          # all hops — L_chain skipped when chunk_c_id is None
         self.id_to_text = id_to_text
+        with_c    = sum(1 for q in quadruples if q.get("chunk_c_id") is not None)
+        without_c = len(quadruples) - with_c
         print(f"[ChainDataset] {len(self.data):,} examples "
-              f"(filtered from {len(quadruples):,} total — 3/4-hop only)")
+              f"({with_c:,} with C-anchor, {without_c:,} without)")
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict:
         q = self.data[idx]
+        c_id = q.get("chunk_c_id")
         return {
             "text_a":     self.id_to_text[q["chunk_a_id"]],
             "text_b_pos": self.id_to_text[q["chunk_b_pos_id"]],
             "text_b_negs":[self.id_to_text[nid] for nid in q["chunk_b_neg_ids"]],
-            "text_c":     self.id_to_text[q["chunk_c_id"]],
+            "text_c":     self.id_to_text[c_id] if c_id else None,
         }
 
 
@@ -273,7 +305,6 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
     def collate(batch: List[Dict]) -> Dict[str, object]:
         texts_a     = [x["text_a"]     for x in batch]
         texts_b_pos = [x["text_b_pos"] for x in batch]
-        texts_c     = [x["text_c"]     for x in batch]
         n_negs      = len(batch[0]["text_b_negs"])
         texts_b_negs = [[x["text_b_negs"][k] for x in batch] for k in range(n_negs)]
 
@@ -286,7 +317,17 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
             enc_negs.append(enc_k)
             b_masks_neg.append(mask_k)
 
-        enc_c = tokenize_passages(texts_c, tokenizer)
+        # C is only available for non-last hops (3/4-hop chains)
+        has_c_list = [x["text_c"] is not None for x in batch]
+        has_c      = torch.tensor(has_c_list, dtype=torch.bool)
+        if any(has_c_list):
+            texts_c_valid = [x["text_c"] for x in batch if x["text_c"] is not None]
+            enc_c = tokenize_passages(texts_c_valid, tokenizer)
+        else:
+            enc_c = None
+
+        enc_a = tokenize_passages(texts_a,     tokenizer)  # standalone A for L_orthogonal
+        enc_b = tokenize_passages(texts_b_pos, tokenizer)  # standalone B for L_content
 
         return {
             "enc_pos":     enc_pos,
@@ -294,6 +335,9 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
             "enc_negs":    enc_negs,
             "b_masks_neg": b_masks_neg,
             "enc_c":       enc_c,
+            "has_c":       has_c,
+            "enc_a":       enc_a,
+            "enc_b":       enc_b,
         }
 
     return collate
@@ -304,7 +348,9 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
 def _forward_batch(model, batch, device):
     """
     Run one forward pass over a collated batch.
-    Returns (complement_pos, b_pad_mask_pos, complement_negs, b_pad_masks_neg, pool_c).
+    Returns (complement_pos, b_pad_mask_pos, complement_negs, b_pad_masks_neg,
+             pool_c, pool_a, pool_b, has_c).
+    pool_c contains embeddings only for examples where has_c is True.
     """
     def to(enc):
         return {k: v.to(device) for k, v in enc.items()}
@@ -316,7 +362,7 @@ def _forward_batch(model, batch, device):
         ep["input_ids"], ep["attention_mask"], ep["token_type_ids"], bmp
     )
 
-    comp_negs   = []
+    comp_negs     = []
     pad_masks_neg = []
     for enc_k, mask_k in zip(batch["enc_negs"], batch["b_masks_neg"]):
         ek = to(enc_k)
@@ -325,10 +371,20 @@ def _forward_batch(model, batch, device):
         comp_negs.append(cn)
         pad_masks_neg.append(pm)
 
-    ec  = to(batch["enc_c"])
-    pc  = model.encode_passage(ec["input_ids"], ec["attention_mask"])
+    has_c = batch["has_c"].to(device)
+    if batch["enc_c"] is not None and has_c.any():
+        ec = to(batch["enc_c"])
+        pc = model.encode_passage(ec["input_ids"], ec["attention_mask"])  # [n_c, 128]
+    else:
+        pc = None
 
-    return comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pc
+    ea = to(batch["enc_a"])
+    pa = model.encode_passage(ea["input_ids"], ea["attention_mask"])
+
+    eb = to(batch["enc_b"])
+    pb = model.encode_passage(eb["input_ids"], eb["attention_mask"])
+
+    return comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pc, pa, pb, has_c
 
 
 def validate(model, val_loader, criterion, device, max_steps=100) -> float:
@@ -336,8 +392,8 @@ def validate(model, val_loader, criterion, device, max_steps=100) -> float:
     total, n = 0.0, 0
     with torch.no_grad():
         for batch in val_loader:
-            cp, mp, cns, mns, pc = _forward_batch(model, batch, device)
-            loss = criterion(cp, mp, cns, mns, pc)
+            cp, mp, cns, mns, pc, pa, pb, hc = _forward_batch(model, batch, device)
+            loss = criterion(cp, mp, cns, mns, pc, pa, pb, hc)
             total += loss.item()
             n     += 1
             if n >= max_steps:
@@ -417,10 +473,11 @@ def train(args) -> ComplementEncoder:
         t0 = time.time()
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}"):
-            comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pool_c = \
+            comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pool_c, pool_a, pool_b, has_c = \
                 _forward_batch(model, batch, DEVICE)
 
-            loss = criterion(comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pool_c)
+            loss = criterion(comp_pos, pad_mask_pos, comp_negs, pad_masks_neg,
+                             pool_c, pool_a, pool_b, has_c)
 
             optimizer.zero_grad()
             loss.backward()
