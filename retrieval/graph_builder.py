@@ -1,15 +1,19 @@
 """
 Chunk Graph Builder (Phase 3).
 
-Builds two types of edges offline:
+Builds three types of edges offline:
   - Sequential: chunk_i → chunk_{i+1} within same document (always)
   - Semantic:   top-10 cosine-similar neighbors with sim > 0.70,
                 skipping adjacent chunks (already have sequential)
+  - BM25:       top-K BM25 lexical-overlap neighbors within same MuSiQue example,
+                skipping chunks already reached by sequential edges.
+                Captures entity-bridging hops (A mentions entity X, B is about X)
+                that cosine similarity misses because they are topically disjoint.
 
 Storage:
-    graph[chunk_id] = [(neighbor_id, cosine_sim, edge_type), ...]
+    graph[chunk_id] = [(neighbor_id, weight, edge_type), ...]
 
-edge_type: "sequential" | "semantic"
+edge_type: "sequential" | "semantic" | "bm25"
 """
 
 import pickle
@@ -24,8 +28,11 @@ from tqdm import tqdm
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+GRAPH_VERSION = "v2"     # bump when edge construction changes to invalidate old caches
+
 SEM_THRESHOLD = 0.70
-SEM_TOP_K = 10      # neighbors to check before threshold filtering
+SEM_TOP_K     = 10       # neighbors to check before threshold filtering
+BM25_TOP_K    = 5        # BM25 within-example neighbors per chunk
 
 
 def build_graph(
@@ -34,6 +41,7 @@ def build_graph(
     embeddings: np.ndarray = None,
     sem_threshold: float = SEM_THRESHOLD,
     sem_top_k: int = SEM_TOP_K,
+    bm25_top_k: int = BM25_TOP_K,
     cache_name: str = None,
 ) -> Dict[str, List[Tuple]]:
     """
@@ -45,7 +53,7 @@ def build_graph(
     Returns:
         graph: {chunk_id: [(neighbor_id, sim, edge_type), ...]}
     """
-    cache_file = CACHE_DIR / f"graph_{cache_name}.pkl" if cache_name else None
+    cache_file = CACHE_DIR / f"graph_{GRAPH_VERSION}_{cache_name}.pkl" if cache_name else None
     if cache_file and cache_file.exists():
         print(f"[graph_builder] Loading from cache {cache_file}")
         with open(cache_file, "rb") as f:
@@ -132,6 +140,49 @@ def build_graph(
     else:
         print("[graph_builder] No embeddings provided — semantic edges skipped")
 
+    # ── 3. BM25 within-example edges ────────────────────────────────────────
+    # Catches entity-bridging hops (A mentions entity X → B is about X) that
+    # cosine similarity misses because the passages are topically disjoint.
+    if bm25_top_k > 0:
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            print("[graph_builder] rank_bm25 not installed — skipping BM25 edges")
+            bm25_top_k = 0
+
+    if bm25_top_k > 0:
+        print(f"[graph_builder] Building BM25 within-example edges (top_k={bm25_top_k})...")
+        ex_chunks: Dict[str, List] = defaultdict(list)
+        for chunk in corpus:
+            ex_chunks[chunk["example_id"]].append(chunk)
+
+        bm25_count = 0
+        for ex_id, ex_list in tqdm(ex_chunks.items(), desc="BM25 edges"):
+            if len(ex_list) < 2:
+                continue
+
+            texts    = [c["text"].lower().split() for c in ex_list]
+            cids     = [c["chunk_id"] for c in ex_list]
+            bm25_idx = BM25Okapi(texts)
+
+            for i in range(len(ex_list)):
+                scores    = bm25_idx.get_scores(texts[i]).copy()
+                scores[i] = -1.0   # exclude self
+
+                top_js = np.argsort(scores)[::-1][:bm25_top_k]
+                for j in top_js:
+                    if scores[j] <= 0:
+                        break
+                    src_id = cids[i]
+                    nbr_id = cids[j]
+                    # Skip chunks already reachable via sequential edge
+                    if nbr_id in seq_neighbors.get(src_id, set()):
+                        continue
+                    graph[src_id].append((nbr_id, 1.0, "bm25"))
+                    bm25_count += 1
+
+        print(f"[graph_builder]   {bm25_count:,} BM25 within-example edges")
+
     graph = dict(graph)
     print(f"[graph_builder] Total graph: {len(graph):,} nodes, "
           f"{sum(len(v) for v in graph.values()):,} directed edges")
@@ -149,10 +200,12 @@ def graph_stats(graph: Dict[str, List[Tuple]]) -> None:
     degrees = [len(v) for v in graph.values()]
     seq_edges = sum(1 for nbrs in graph.values() for (_, _, t) in nbrs if t == "sequential")
     sem_edges = sum(1 for nbrs in graph.values() for (_, _, t) in nbrs if t == "semantic")
+    bm25_edges = sum(1 for nbrs in graph.values() for (_, _, t) in nbrs if t == "bm25")
 
     print(f"\n[graph_stats] Nodes:          {len(graph):>10,}")
     print(f"[graph_stats] Sequential edges: {seq_edges:>10,}")
     print(f"[graph_stats] Semantic edges:   {sem_edges:>10,}")
+    print(f"[graph_stats] BM25 edges:       {bm25_edges:>10,}")
     print(f"[graph_stats] Avg degree:       {sum(degrees)/len(degrees):>10.2f}")
     print(f"[graph_stats] Max degree:       {max(degrees):>10,}")
     print(f"[graph_stats] Min degree:       {min(degrees):>10,}")

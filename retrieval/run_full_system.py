@@ -18,7 +18,6 @@ Usage:
 
 import argparse
 import json
-import pickle
 import sys
 import time
 from pathlib import Path
@@ -348,13 +347,7 @@ def main():
     dense.index.reconstruct_n(0, n, embeddings)
 
     # ── Graph ────────────────────────────────────────────────────────────────
-    graph_cache = CACHE_DIR / f"graph_{cache_name}.pkl"
-    if graph_cache.exists():
-        with open(graph_cache, "rb") as f:
-            graph = pickle.load(f)
-        print(f"[runner] Loaded graph: {sum(len(v) for v in graph.values()):,} edges")
-    else:
-        graph = build_graph(corpus, embeddings=embeddings, cache_name=cache_name)
+    graph = build_graph(corpus, embeddings=embeddings, cache_name=cache_name)
 
     # ── Load trained models ──────────────────────────────────────────────────
     m1_ckpt = MODEL_DIR / "model1_complement.pt"

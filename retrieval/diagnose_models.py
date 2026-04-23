@@ -16,7 +16,6 @@ Usage (run from retrieval/ directory):
 """
 
 import argparse
-import pickle
 import sys
 import time
 from collections import defaultdict
@@ -648,13 +647,7 @@ def main():
     id_to_idx   = {c["chunk_id"]: i for i, c in enumerate(corpus)}
 
     # ── Build / load graph ─────────────────────────────────────────────────────
-    graph_cache = CACHE_DIR / f"graph_{cache_name}.pkl"
-    if graph_cache.exists():
-        with open(graph_cache, "rb") as fh:
-            graph = pickle.load(fh)
-        print(f"[diagnose] Loaded graph ({sum(len(v) for v in graph.values()):,} edges)")
-    else:
-        graph = build_graph(corpus, embeddings=embeddings, cache_name=cache_name)
+    graph = build_graph(corpus, embeddings=embeddings, cache_name=cache_name)
 
     # ── Load models ────────────────────────────────────────────────────────────
     models = load_models()
