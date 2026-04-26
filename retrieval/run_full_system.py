@@ -1,15 +1,15 @@
 """
 Full system evaluation: graph traversal with trained Model 1 + Model 2.
 
-Architecture (new):
+Architecture:
   Model 1 — ComplementEncoder: BERT([A; B]) → B-side token matrix [n × 128]
-  Model 2 — ColBERTQueryEncoder: BERT(Q) → Q-token matrix [k × 128]
-  Scoring: ColBERT MaxSim(Q_tokens, complement_tokens)
+  Model 2 — QueryEncoder: BERT(Q) → mean-pooled query vector [128]
+  Scoring: mean_pool(Q) · mean_pool(complement(A, B))
 
 Compares:
   - MDR dense (iterative query extension baseline)
   - Graph traversal with direct cosine similarity only
-  - FULL: Graph + M1 complement + M2 ColBERT MaxSim scoring
+  - FULL: Graph + M1 complement + M2 dot-product scoring
 
 Usage:
     python run_full_system.py --max_examples 300
@@ -36,8 +36,8 @@ from evaluate import evaluate_retriever, compare_systems
 from baselines import DenseRetriever, BM25Retriever, reciprocal_rank_fusion
 from graph_builder import build_graph
 from mdr_baseline import MDRBaseline
-from model1_train import ComplementEncoder
-from model2_train import ColBERTQueryEncoder, colbert_maxsim
+from model1_train import ComplementEncoder, mean_pool
+from model2_train import QueryEncoder
 
 CACHE_DIR   = Path(__file__).parent / "cache"
 MODEL_DIR   = Path(__file__).parent / "models"
@@ -45,7 +45,7 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-ALPHA        = 0.5      # weight for ColBERT MaxSim vs direct cosine similarity
+ALPHA        = 0.5      # weight for M2 score vs direct cosine similarity
 BEAM_WIDTH   = 3
 MAX_HOPS     = 3
 N_SEEDS      = 5
@@ -61,12 +61,13 @@ class LiveScorer:
     """
     Wraps complement encoder + query encoder for on-the-fly scoring during beam search.
     Encodes query once per question; encodes (A, B) complement per candidate pair.
+    Score = mean_pool(Q) · mean_pool(complement(A, B))  — dot product in shared 128-dim space.
     """
 
     def __init__(
         self,
         comp_enc:     ComplementEncoder,
-        query_enc:    ColBERTQueryEncoder,
+        query_enc:    QueryEncoder,
         ab_tokenizer: BertTokenizerFast,
         q_tokenizer:  BertTokenizerFast,
         device:       str = DEVICE,
@@ -82,28 +83,28 @@ class LiveScorer:
         query_enc.eval()
 
     @torch.no_grad()
-    def encode_query(self, question: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode query → (q_tokens [1, k, 128], q_mask [1, k])."""
+    def encode_query(self, question: str) -> torch.Tensor:
+        """Encode query → q_vec [1, 128] L2-normalised."""
         enc = self.q_tokenizer(
             text=question, max_length=MAX_LEN_Q,
             truncation=True, padding="max_length", return_tensors="pt",
         )
-        q_tokens, q_mask = self.query_enc(
+        q_vec = self.query_enc(
             enc["input_ids"].to(self.device),
             enc["attention_mask"].to(self.device),
         )
-        return q_tokens, q_mask
+        return q_vec   # [1, 128]
 
     @torch.no_grad()
     def complement_score(
         self,
-        q_tokens: torch.Tensor,   # [1, k, 128]
-        q_mask:   torch.Tensor,   # [1, k]
-        text_a:   str,
-        text_b:   str,
+        q_vec:  torch.Tensor,   # [1, 128]
+        text_a: str,
+        text_b: str,
     ) -> float:
         """
-        Compute ColBERT MaxSim score for hop A→B given query Q.
+        Compute M2 score for hop A→B given query Q.
+        Score = dot( q_vec, mean_pool(complement(A, B)) ).
         Returns scalar float.
         """
         enc = self.ab_tokenizer(
@@ -121,8 +122,8 @@ class LiveScorer:
             enc["token_type_ids"].to(self.device),
             b_mask,
         )
-        score = colbert_maxsim(q_tokens, q_mask, comp_tokens, pad_mask)
-        return score.item()
+        c_vec = mean_pool(comp_tokens, pad_mask)   # [1, 128]
+        return float((q_vec * c_vec).sum(-1).item())
 
 
 # ── Full Graph Traversal ──────────────────────────────────────────────────────
@@ -130,10 +131,10 @@ class LiveScorer:
 class FullGraphTraversal:
     """
     Beam search over passage graph, scoring each hop with:
-        alpha * ColBERT_MaxSim(Q, complement(A, B))
+        alpha * M2_score(Q, complement(A, B))
         + (1 - alpha) * cos_sim(query_emb, B_emb)
 
-    Model 1 (ComplementEncoder) and Model 2 (ColBERTQueryEncoder) are run
+    Model 1 (ComplementEncoder) and Model 2 (QueryEncoder) are run
     on-the-fly per candidate pair — no pre-computed edge vectors needed.
     """
 
@@ -171,8 +172,8 @@ class FullGraphTraversal:
         bm25_list  = self.bm25.retrieve(question,  top_k=self.n_seeds * 3)
         seeds      = reciprocal_rank_fusion([dense_list, bm25_list])[:self.n_seeds]
 
-        # Encode query tokens once (used for all ColBERT MaxSim calls)
-        q_tokens, q_mask = self.scorer.encode_query(question)
+        # Encode query once (used for all M2 scoring calls)
+        q_vec = self.scorer.encode_query(question)
 
         # Pooled query embedding for direct cosine similarity fallback
         query_emb = self.dense.embed_query(question)
@@ -205,9 +206,9 @@ class FullGraphTraversal:
                     if nbr_idx is None or text_b is None:
                         continue
 
-                    # ColBERT MaxSim: query-conditional hop relevance
+                    # M2 score: query-conditional hop relevance
                     colbert_score = self.scorer.complement_score(
-                        q_tokens, q_mask, text_a, text_b
+                        q_vec, text_a, text_b
                     )
                     # Direct similarity: query vs neighbor embedding
                     direct_sim = float(np.dot(query_emb, self.embeddings[nbr_idx]))
@@ -325,7 +326,7 @@ def main():
                         help="Cap MuSiQue dev examples (None = all 2417)")
     parser.add_argument("--top_k",        type=int, default=10)
     parser.add_argument("--alpha",        type=float, default=ALPHA,
-                        help="Weight for ColBERT score vs direct cosine")
+                        help="Weight for M2 score vs direct cosine")
     args = parser.parse_args()
 
     # ── Data ────────────────────────────────────────────────────────────────
@@ -359,7 +360,7 @@ def main():
         comp_enc.load_state_dict(torch.load(m1_ckpt, map_location=DEVICE))
         comp_enc.eval()
 
-        query_enc = ColBERTQueryEncoder().to(DEVICE)
+        query_enc = QueryEncoder().to(DEVICE)
         query_enc.load_state_dict(torch.load(m2_ckpt, map_location=DEVICE))
         query_enc.eval()
 
@@ -367,7 +368,7 @@ def main():
         q_tokenizer  = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
         scorer = LiveScorer(comp_enc, query_enc, ab_tokenizer, q_tokenizer, DEVICE)
-        print("[runner] Loaded Model 1 (ComplementEncoder) + Model 2 (ColBERTScorer)")
+        print("[runner] Loaded Model 1 (ComplementEncoder) + Model 2 (QueryScorer)")
     else:
         missing = []
         if not m1_ckpt.exists(): missing.append(str(m1_ckpt))
@@ -398,16 +399,16 @@ def main():
         full = FullGraphTraversal(
             scorer, graph, corpus, embeddings, dense, bm25, alpha=args.alpha
         )
-        all_systems["FULL: Graph + M1 + M2 (ColBERT)"] = run_retriever(
-            "Full-ColBERT", full, queries, args.top_k
+        all_systems["FULL: Graph + M1 + M2"] = run_retriever(
+            "Full-M2", full, queries, args.top_k
         )
 
     # ── Results ──────────────────────────────────────────────────────────────
     compare_systems(all_systems)
 
-    if scorer is not None and "FULL: Graph + M1 + M2 (ColBERT)" in all_systems:
+    if scorer is not None and "FULL: Graph + M1 + M2" in all_systems:
         mdr_r10  = all_systems["MDR (dense, iterative)"]["recall@10"]
-        full_r10 = all_systems["FULL: Graph + M1 + M2 (ColBERT)"]["recall@10"]
+        full_r10 = all_systems["FULL: Graph + M1 + M2"]["recall@10"]
         gap      = full_r10 - mdr_r10
         print(f"\n[DECISION GATE] Full system R@10: {full_r10:.4f}")
         print(f"[DECISION GATE] MDR baseline R@10: {mdr_r10:.4f}")

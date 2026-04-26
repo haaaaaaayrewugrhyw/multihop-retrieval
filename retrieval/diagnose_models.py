@@ -34,7 +34,7 @@ from data_loader import load_musique, build_chain_quadruples, build_scoring_quin
 from graph_builder import build_graph
 from baselines import DenseRetriever, BM25Retriever, reciprocal_rank_fusion
 from model1_train import ComplementEncoder, mean_pool
-from model2_train import ColBERTQueryEncoder, colbert_maxsim
+from model2_train import QueryEncoder
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODEL_DIR = Path(__file__).parent / "models"
@@ -70,7 +70,7 @@ def load_models():
     for p in comp_enc.parameters():
         p.requires_grad_(False)
 
-    query_enc = ColBERTQueryEncoder().to(DEVICE)
+    query_enc = QueryEncoder().to(DEVICE)
     query_enc.load_state_dict(torch.load(m2_ckpt, map_location=DEVICE))
     query_enc.eval()
     for p in query_enc.parameters():
@@ -142,8 +142,8 @@ def complement_tokens(comp_enc, ab_tok, text_a: str, text_b: str):
 
 
 @torch.no_grad()
-def query_tokens(query_enc, q_tok, question: str):
-    """Query token matrix for ColBERT MaxSim. Returns (q_tok [1,k,128], q_mask [1,k])."""
+def query_vec(query_enc, q_tok, question: str) -> torch.Tensor:
+    """Encode query → q_vec [1, 128] L2-normalised mean pool."""
     enc = q_tok(
         text=question, max_length=MAX_LEN_Q,
         truncation=True, padding="max_length", return_tensors="pt",
@@ -151,7 +151,13 @@ def query_tokens(query_enc, q_tok, question: str):
     return query_enc(
         enc["input_ids"].to(DEVICE),
         enc["attention_mask"].to(DEVICE),
-    )
+    )  # [1, 128]
+
+
+def m2_score(q_vec_t: torch.Tensor, comp_tokens: torch.Tensor, pad_mask: torch.Tensor) -> float:
+    """M2 score: dot(q_vec, mean_pool(complement_tokens)). Returns float."""
+    c_vec = mean_pool(comp_tokens, pad_mask)   # [1, 128]
+    return float((q_vec_t * c_vec).sum(-1).item())
 
 
 # ── DIAGNOSTIC 1 — M1 Complement Discriminability ────────────────────────────
@@ -262,7 +268,7 @@ def diag_m2_rank(comp_enc, query_enc, ab_tok, q_tok,
                  max_samples=300):
     """
     Among all graph neighbors of A, rank B_pos by:
-      (a) ColBERT MaxSim(Q, complement(A, nbr))
+      (a) M2 score: mean_pool(Q) · mean_pool(complement(A, nbr))
       (b) cosine(e5-query-emb, e5-passage-emb)   ← mirrors actual system
       (c) alpha-blend of (a) and (b)
     Report mean rank of B_pos and top-1/top-3 hit rates.
@@ -287,8 +293,8 @@ def diag_m2_rank(comp_enc, query_enc, ab_tok, q_tok,
         a_id     = item["chunk_a_id"]
         text_a   = id_to_text.get(a_id, "")
 
-        q_tok_t, q_mask_t = query_tokens(query_enc, q_tok, question)
-        q_emb             = dense.embed_query(question)   # 384-dim e5
+        q_vec_t = query_vec(query_enc, q_tok, question)
+        q_emb   = dense.embed_query(question)   # 384-dim e5
 
         cb_scores  = {}
         cos_scores = {}
@@ -299,8 +305,8 @@ def diag_m2_rank(comp_enc, query_enc, ab_tok, q_tok,
             if not text_b or nid_idx is None:
                 continue
 
-            c_tok, c_pad = complement_tokens(comp_enc, ab_tok, text_a, text_b)
-            cb_scores[nid]  = colbert_maxsim(q_tok_t, q_mask_t, c_tok, c_pad).item()
+            c_tok, c_pad    = complement_tokens(comp_enc, ab_tok, text_a, text_b)
+            cb_scores[nid]  = m2_score(q_vec_t, c_tok, c_pad)
             cos_scores[nid] = float(np.dot(q_emb, embeddings[nid_idx]))
 
         if b_pos_id not in cb_scores:
@@ -341,7 +347,7 @@ def diag_m2_rank(comp_enc, query_enc, ab_tok, q_tok,
         w = 22
         print(f"  {'Method':<{w}}  {'MeanRank':>8}  {'Top-1%':>7}  {'Top-3%':>7}")
         print(f"  {'─'*w}  {'─'*8}  {'─'*7}  {'─'*7}")
-        print(f"  {'ColBERT MaxSim':<{w}}  {mr_cb:>8.2f}  {t1_cb:>6.1f}%  {t3_cb:>6.1f}%")
+        print(f"  {'M2 (mean-pool dot)':<{w}}  {mr_cb:>8.2f}  {t1_cb:>6.1f}%  {t3_cb:>6.1f}%")
         print(f"  {'Cosine (e5-small-v2)':<{w}}  {mr_cos:>8.2f}  {t1_cos:>6.1f}%  {t3_cos:>6.1f}%")
         print(f"  {'Alpha-blend (0.5/0.5)':<{w}}  {mr_bl:>8.2f}  {t1_bl:>6.1f}%  {t3_bl:>6.1f}%")
 
@@ -363,9 +369,9 @@ def diag_agreement(comp_enc, query_enc, ab_tok, q_tok,
     """
     For each (Q, A, B_pos, B_negs) where both B_pos and at least one B_neg are in graph[A]:
     Classify each (B_pos vs B_neg) comparison as:
-      both_correct / colbert_only / cosine_only / both_wrong
+      both_correct / m2_only / cosine_only / both_wrong
     """
-    print("\n[DIAG 4] ColBERT vs Cosine Agreement" + "─"*36)
+    print("\n[DIAG 4] M2 vs Cosine Agreement" + "─"*41)
 
     nbr_sets = {
         item["chunk_a_id"]: {nid for (nid,_,_) in graph.get(item["chunk_a_id"],[])}
@@ -388,11 +394,11 @@ def diag_agreement(comp_enc, query_enc, ab_tok, q_tok,
 
         text_a   = id_to_text.get(a_id, "")
         t_bpos   = id_to_text.get(b_pos_id, "")
-        q_tok_t, q_mask_t = query_tokens(query_enc, q_tok, item["question"])
-        q_emb             = dense.embed_query(item["question"])
+        q_vec_t  = query_vec(query_enc, q_tok, item["question"])
+        q_emb    = dense.embed_query(item["question"])
 
         c_pos_tok, c_pos_pad = complement_tokens(comp_enc, ab_tok, text_a, t_bpos)
-        cb_pos  = colbert_maxsim(q_tok_t, q_mask_t, c_pos_tok, c_pos_pad).item()
+        cb_pos   = m2_score(q_vec_t, c_pos_tok, c_pos_pad)
         bpos_idx = id_to_idx.get(b_pos_id)
         cos_pos  = float(np.dot(q_emb, embeddings[bpos_idx])) if bpos_idx is not None else 0.0
 
@@ -401,7 +407,7 @@ def diag_agreement(comp_enc, query_enc, ab_tok, q_tok,
             neg_idx  = id_to_idx[neg_id]
 
             c_neg_tok, c_neg_pad = complement_tokens(comp_enc, ab_tok, text_a, t_bneg)
-            cb_neg   = colbert_maxsim(q_tok_t, q_mask_t, c_neg_tok, c_neg_pad).item()
+            cb_neg   = m2_score(q_vec_t, c_neg_tok, c_neg_pad)
             cos_neg  = float(np.dot(q_emb, embeddings[neg_idx]))
 
             cb_ok  = cb_pos  > cb_neg
@@ -417,25 +423,25 @@ def diag_agreement(comp_enc, query_enc, ab_tok, q_tok,
             else:
                 both_wrong   += 1
 
-    r = {"n": n, "both_correct": both_correct, "colbert_only": colbert_only,
+    r = {"n": n, "both_correct": both_correct, "m2_only": colbert_only,
          "cosine_only": cosine_only, "both_wrong": both_wrong}
 
     if n:
         print(f"  Comparisons (B_pos vs B_neg)     : {n}")
         print(f"  Both correct   : {both_correct:>5}  ({both_correct/n*100:5.1f}%)")
-        print(f"  ColBERT only   : {colbert_only:>5}  ({colbert_only/n*100:5.1f}%)")
+        print(f"  M2 only        : {colbert_only:>5}  ({colbert_only/n*100:5.1f}%)")
         print(f"  Cosine  only   : {cosine_only:>5}  ({cosine_only/n*100:5.1f}%)")
         print(f"  Both wrong     : {both_wrong:>5}  ({both_wrong/n*100:5.1f}%)")
 
         net = (colbert_only - cosine_only) / n * 100
-        print(f"  ColBERT net gain vs cosine        : {net:+.1f}%")
+        print(f"  M2 net gain vs cosine             : {net:+.1f}%")
 
         if net < -1:
-            print("  VERDICT: *** ColBERT HURTS more than it helps (negative net) ***")
+            print("  VERDICT: *** M2 HURTS more than it helps (negative net) ***")
         elif abs(net) < 1:
-            print("  VERDICT:  ~  ColBERT and cosine agree almost everywhere — M2 adds nothing")
+            print("  VERDICT:  ~  M2 and cosine agree almost everywhere — M2 adds nothing")
         else:
-            print(f"  VERDICT:  ✓  ColBERT corrects cosine in +{net:.1f}% of extra cases")
+            print(f"  VERDICT:  ✓  M2 corrects cosine in +{net:.1f}% of extra cases")
     return r
 
 
@@ -466,8 +472,8 @@ def diag_beam_reach(comp_enc, query_enc, ab_tok, q_tok,
         seed     = chain[0]
         target   = chain[1]
 
-        q_tok_t, q_mask_t = query_tokens(query_enc, q_tok, q["question"])
-        q_emb             = dense.embed_query(q["question"])  # e5-small-v2, same as live system
+        q_vec_t = query_vec(query_enc, q_tok, q["question"])
+        q_emb   = dense.embed_query(q["question"])  # e5-small-v2, same as live system
 
         retrieved_set = {seed}
         beam          = [seed]
@@ -496,8 +502,8 @@ def diag_beam_reach(comp_enc, query_enc, ab_tok, q_tok,
                         continue
 
                     c_tok, c_pad = complement_tokens(comp_enc, ab_tok, text_a, text_b)
-                    cb   = colbert_maxsim(q_tok_t, q_mask_t, c_tok, c_pad).item()
-                    cos  = float(np.dot(q_emb, embeddings[nbr_idx]))
+                    cb    = m2_score(q_vec_t, c_tok, c_pad)
+                    cos   = float(np.dot(q_emb, embeddings[nbr_idx]))
                     final = ALPHA * cb + (1-ALPHA) * cos
                     if nbr_id not in candidates or final > candidates[nbr_id]:
                         candidates[nbr_id] = final
