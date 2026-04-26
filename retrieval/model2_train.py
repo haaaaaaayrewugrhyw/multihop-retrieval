@@ -1,43 +1,47 @@
 """
-Model 2 — ColBERTScorer
+Model 2 — QueryScorer
 
 Architecture:
-    Query encoder  : BERT → Q tokens [k × 128], L2-normalised
-    Passage scorer : ColBERT MaxSim against complement_tokens from Model 1
+    Query encoder : bert-base-uncased → mean-pooled query vector [128], L2-normalised
+    Scoring       : dot product of query vector against mean-pooled complement from Model 1
 
-    score(Q, complement(A, B)) = Σ_i  max_j  cos( Q_token_i, complement_token_j )
+    score(Q, complement(A, B)) = mean_pool(Q_tokens) · mean_pool(complement_tokens)
 
-Why MaxSim instead of pooled dot-product:
-    Each query token independently finds its best match in B's novel content.
-    "Who founded" finds founder tokens; "born in" finds birthplace tokens.
-    The score sums how many aspects of Q are covered by B's novel content.
-    Query is introduced FRESH at scoring time — no pre-computation information loss.
-    I(Q; complement_tokens) = 0 (correct: Model 1 is query-agnostic).
-    I(Q; score) is high (correct: Model 2 is fully query-conditional).
+Why same backbone as Model 1 (bert-base, not ColBERTv2):
+    Model 1's projection layer maps BERT hidden states → 128-dim complement space.
+    Scoring requires Q and complement to be in the SAME 128-dim space.
+    ColBERTv2 uses a different projection — cross-space MaxSim needs 100K+ examples
+    to align the two spaces; we have 26K.  Same backbone = no alignment problem.
+
+Why mean-pool (not MaxSim):
+    MaxSim is expressive but overfits badly with limited data (observed: train→0.005,
+    val→0.29 gap with ColBERT approach).  Mean-pool reduces the hypothesis space to a
+    single direction per example — robust with 26K training instances.
 
 Initialisation:
-    Query encoder initialised from colbert-ir/colbertv2.0 (pre-trained on MS MARCO).
-    Fine-tuned on MuSiQue quintuples (all hop counts: 2, 3, 4-hop).
+    Query encoder loaded from model1_complement.pt (same BERT + proj weights).
+    This gives the query encoder a head start: it already knows the complement space.
+    Fine-tuned with a small LR to orient Q vectors toward relevant complements.
 
 Loss — Margin Ranking:
     For each (Q, A, B_pos, B_neg_1..3):
-        score_pos = MaxSim(Q_tokens, complement(A, B_pos))
-        score_neg = MaxSim(Q_tokens, complement(A, B_neg_i))
+        score_pos = dot( q_vec, mean_pool(complement(A, B_pos)) )
+        score_neg = dot( q_vec, mean_pool(complement(A, B_neg_i)) )
         loss      = mean( relu( margin + score_neg - score_pos ) )
 
     Model 1 is FROZEN during Model 2 training.
-    This preserves the query-agnostic property of Model 1.
+    Checkpoint saved by best val ACCURACY (not loss) — accuracy is the retrieval metric.
 
 Training data: MuSiQue train, ALL hop counts (uses build_scoring_quintuples)
-    ~26K directed (A→B) pairs × 4 = ~104K training instances.
+    ~26K directed (A→B) pairs, 3 hard negatives per positive.
 
 Usage:
     python model2_train.py --max_examples 300    # smoke test
-    python model2_train.py                        # full training (Colab recommended)
+    python model2_train.py                        # full training
     python model2_train.py --eval_only            # evaluate saved checkpoint
 
 Output:
-    models/model2_scorer.pt    trained ColBERTScorer (query encoder) weights
+    models/model2_scorer.pt    trained QueryScorer weights (best val accuracy)
 """
 
 import argparse
@@ -61,9 +65,7 @@ MODEL_DIR = Path(__file__).parent / "models"
 CACHE_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
-# ColBERTv2 pre-trained on MS MARCO — used to initialise query encoder
-COLBERT_CKPT = "colbert-ir/colbertv2.0"
-BERT_FALLBACK = "bert-base-uncased"     # used if ColBERT checkpoint unavailable
+BERT_NAME   = "bert-base-uncased"    # same backbone as Model 1
 
 PROJ_DIM    = 128        # must match Model 1's PROJ_DIM
 DROPOUT     = 0.1
@@ -80,72 +82,54 @@ DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── Query Encoder ──────────────────────────────────────────────────────────────
 
-class ColBERTQueryEncoder(nn.Module):
+class QueryEncoder(nn.Module):
     """
-    Encodes a query → token matrix [k × PROJ_DIM], L2-normalised.
+    Encodes a query Q → mean-pooled vector [PROJ_DIM], L2-normalised.
 
-    Initialised from ColBERTv2 (MS MARCO pre-trained) if available,
-    otherwise falls back to bert-base-uncased.
+    Same architecture as Model 1's ComplementEncoder (bert-base + linear proj).
+    Initialised from model1_complement.pt so both Q and complement representations
+    start in the same 128-dim projection space — no cross-space alignment needed.
     """
 
-    def __init__(self, bert_name: str = COLBERT_CKPT, proj_dim: int = PROJ_DIM,
+    def __init__(self, bert_name: str = BERT_NAME, proj_dim: int = PROJ_DIM,
                  dropout: float = DROPOUT):
         super().__init__()
-        try:
-            self.bert = BertModel.from_pretrained(bert_name)
-            print(f"[ColBERTQueryEncoder] Loaded from {bert_name}")
-        except Exception as e:
-            print(f"[ColBERTQueryEncoder] Could not load {bert_name}: {e}")
-            print(f"[ColBERTQueryEncoder] Falling back to {BERT_FALLBACK}")
-            self.bert = BertModel.from_pretrained(BERT_FALLBACK)
-        self.proj    = nn.Sequential(nn.Linear(self.bert.config.hidden_size, proj_dim),
-                                     nn.Dropout(dropout))
+        self.bert = BertModel.from_pretrained(bert_name)
+        self.proj = nn.Sequential(nn.Linear(self.bert.config.hidden_size, proj_dim),
+                                  nn.Dropout(dropout))
 
     def forward(
         self,
         input_ids:      torch.Tensor,   # [B, q_len]
         attention_mask: torch.Tensor,   # [B, q_len]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Returns:
-            q_tokens  [B, q_len, PROJ_DIM]  L2-normalised query token embeddings
-            q_mask    [B, q_len]             True for non-padding tokens
+            q_vec  [B, PROJ_DIM]  L2-normalised mean-pooled query vector
         """
         out    = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         hidden = out.last_hidden_state                     # [B, q_len, 768]
         proj   = F.normalize(self.proj(hidden), dim=-1)   # [B, q_len, PROJ_DIM]
-        q_mask = attention_mask.bool()
-        return proj, q_mask
+        mask_f = attention_mask.unsqueeze(-1).float()
+        pool   = (proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1e-9)
+        return F.normalize(pool, dim=-1)                   # [B, PROJ_DIM]
 
 
-# ── ColBERT MaxSim ─────────────────────────────────────────────────────────────
+# ── Mean-Pool Dot Product Scoring ──────────────────────────────────────────────
 
-def colbert_maxsim(
-    q_tokens:  torch.Tensor,   # [B, q_len, dim]
-    q_mask:    torch.Tensor,   # [B, q_len] bool
-    p_tokens:  torch.Tensor,   # [B, p_len, dim]
-    p_mask:    torch.Tensor,   # [B, p_len] bool
+def mean_pool_score(
+    q_vec:      torch.Tensor,   # [B, dim]
+    comp_tokens: torch.Tensor,  # [B, p_len, dim]
+    comp_mask:  torch.Tensor,   # [B, p_len] bool
 ) -> torch.Tensor:
     """
-    ColBERT MaxSim scoring:
-        For each query token, find the max cosine similarity with any passage token.
-        Sum over all query tokens (masked).
-
+    Score = dot( q_vec, mean_pool(complement_tokens) ).
+    Both vectors are L2-normalised → equivalent to cosine similarity.
     Returns score [B].
     """
-    # [B, q_len, p_len]  (tokens already L2-normalised → cosine = dot product)
-    sim = torch.bmm(q_tokens, p_tokens.transpose(1, 2))
-
-    # Mask padding in passage dimension: set to -inf so they never win max
-    p_pad = ~p_mask.unsqueeze(1)                         # [B, 1, p_len]
-    sim   = sim.masked_fill(p_pad, -1e9)
-
-    max_sim = sim.max(dim=-1).values                     # [B, q_len]
-
-    # Mask padding in query dimension
-    max_sim = max_sim.masked_fill(~q_mask, 0.0)
-
-    return max_sim.sum(dim=-1)                           # [B]
+    from model1_train import mean_pool
+    c_vec = mean_pool(comp_tokens, comp_mask)   # [B, dim]
+    return (q_vec * c_vec).sum(-1)              # [B]
 
 
 # ── Scoring Dataset ────────────────────────────────────────────────────────────
@@ -238,10 +222,10 @@ def _complement(comp_encoder, enc, b_mask, device):
 def _forward_batch(query_enc, comp_enc, batch, device):
     """
     Run one batch through both encoders.
-    Returns (q_tokens, q_mask, comp_pos, pad_pos, comp_negs, pad_negs).
+    Returns (q_vec, comp_pos, pad_pos, comp_negs, pad_negs).
     """
     enc_q = {k: v.to(device) for k, v in batch["enc_q"].items()}
-    q_tokens, q_mask = query_enc(enc_q["input_ids"], enc_q["attention_mask"])
+    q_vec = query_enc(enc_q["input_ids"], enc_q["attention_mask"])   # [B, 128]
 
     comp_pos, pad_pos = _complement(comp_enc, batch["enc_pos"], batch["b_mask_pos"], device)
 
@@ -251,7 +235,7 @@ def _forward_batch(query_enc, comp_enc, batch, device):
         comp_negs.append(cn)
         pad_negs.append(pm)
 
-    return q_tokens, q_mask, comp_pos, pad_pos, comp_negs, pad_negs
+    return q_vec, comp_pos, pad_pos, comp_negs, pad_negs
 
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
@@ -287,15 +271,14 @@ def validate(query_enc, comp_enc, val_loader, criterion, device, max_steps=100) 
 
     with torch.no_grad():
         for batch in val_loader:
-            q_tok, q_mask, cp, pp, cns, pns = _forward_batch(query_enc, comp_enc, batch, device)
+            q_vec, cp, pp, cns, pns = _forward_batch(query_enc, comp_enc, batch, device)
 
-            score_pos  = colbert_maxsim(q_tok, q_mask, cp, pp)
-            score_negs = [colbert_maxsim(q_tok, q_mask, cn, pn) for cn, pn in zip(cns, pns)]
+            score_pos  = mean_pool_score(q_vec, cp, pp)
+            score_negs = [mean_pool_score(q_vec, cn, pn) for cn, pn in zip(cns, pns)]
 
             loss = criterion(score_pos, score_negs)
             total_loss += loss.item()
 
-            # Accuracy: pos beats all negs
             neg_stack = torch.stack(score_negs, dim=-1)   # [B, n_negs]
             correct  += (score_pos.unsqueeze(-1) > neg_stack).all(dim=-1).float().sum().item()
             n        += score_pos.shape[0]
@@ -339,8 +322,8 @@ def train(args):
 
     # ── Tokenisers ──
     # Both encoders use the same BERT tokeniser family
-    q_tokenizer  = BertTokenizerFast.from_pretrained(BERT_FALLBACK)
-    ab_tokenizer = BertTokenizerFast.from_pretrained(BERT_FALLBACK)
+    q_tokenizer  = BertTokenizerFast.from_pretrained(BERT_NAME)
+    ab_tokenizer = BertTokenizerFast.from_pretrained(BERT_NAME)
     collate      = make_collate_fn(q_tokenizer, ab_tokenizer)
 
     train_loader = DataLoader(
@@ -356,20 +339,25 @@ def train(args):
     )
 
     # ── Models ──
-    query_enc = ColBERTQueryEncoder().to(DEVICE)
-
     # Load frozen Model 1 complement encoder
-    comp_enc  = ComplementEncoder().to(DEVICE)
-    m1_ckpt   = MODEL_DIR / "model1_complement.pt"
+    comp_enc = ComplementEncoder().to(DEVICE)
+    m1_ckpt  = MODEL_DIR / "model1_complement.pt"
     if m1_ckpt.exists():
         comp_enc.load_state_dict(torch.load(m1_ckpt, map_location=DEVICE))
         print(f"[train] Loaded Model 1 from {m1_ckpt}")
     else:
-        print(f"[train] WARNING: Model 1 checkpoint not found at {m1_ckpt}")
-        print(f"[train]          Using untrained complement encoder (train Model 1 first).")
+        raise FileNotFoundError(
+            f"Model 1 checkpoint not found at {m1_ckpt} — train Model 1 first."
+        )
     comp_enc.eval()
     for p in comp_enc.parameters():
         p.requires_grad_(False)
+
+    # Query encoder — same architecture as Model 1, initialised from Model 1 weights.
+    # Both Q and complement are now in the same 128-dim projection space from the start.
+    query_enc = QueryEncoder().to(DEVICE)
+    query_enc.load_state_dict(torch.load(m1_ckpt, map_location=DEVICE))
+    print(f"[train] Query encoder initialised from Model 1 weights (shared projection space)")
 
     # ── Optimiser — only trains query encoder ──
     optimizer  = torch.optim.AdamW(query_enc.parameters(), lr=LR, weight_decay=1e-2)
@@ -379,9 +367,9 @@ def train(args):
     )
     criterion  = MarginRankingLoss(margin=MARGIN)
 
-    best_val   = float("inf")
-    step       = 0
-    running    = 0.0
+    best_val_acc = 0.0
+    step         = 0
+    running      = 0.0
 
     print(f"[train] {len(train_loader):,} steps/epoch × {EPOCHS} epochs = {total_steps:,} total")
 
@@ -390,10 +378,10 @@ def train(args):
         t0 = time.time()
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}"):
-            q_tok, q_mask, cp, pp, cns, pns = _forward_batch(query_enc, comp_enc, batch, DEVICE)
+            q_vec, cp, pp, cns, pns = _forward_batch(query_enc, comp_enc, batch, DEVICE)
 
-            score_pos  = colbert_maxsim(q_tok, q_mask, cp, pp)
-            score_negs = [colbert_maxsim(q_tok, q_mask, cn, pn) for cn, pn in zip(cns, pns)]
+            score_pos  = mean_pool_score(q_vec, cp, pp)
+            score_negs = [mean_pool_score(q_vec, cn, pn) for cn, pn in zip(cns, pns)]
 
             loss = criterion(score_pos, score_negs)
 
@@ -407,26 +395,27 @@ def train(args):
             step    += 1
 
             if step % EVAL_EVERY == 0:
-                avg_train        = running / EVAL_EVERY
+                avg_train         = running / EVAL_EVERY
                 val_loss, val_acc = validate(query_enc, comp_enc, val_loader, criterion, DEVICE)
-                running          = 0.0
+                running           = 0.0
                 print(
                     f"  step {step:>5} | train {avg_train:.4f} | val {val_loss:.4f}"
                     f" | acc {val_acc:.3f} | lr {scheduler.get_last_lr()[0]:.2e}"
                 )
-                if val_loss < best_val:
-                    best_val = val_loss
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
                     torch.save(query_enc.state_dict(), MODEL_DIR / "model2_scorer.pt")
-                    print(f"  *** best val={val_loss:.4f} → checkpoint saved ***")
+                    print(f"  *** best acc={val_acc:.3f} → checkpoint saved ***")
 
         print(f"Epoch {epoch} done in {time.time()-t0:.0f}s")
 
     val_loss, val_acc = validate(query_enc, comp_enc, val_loader, criterion, DEVICE, max_steps=999)
     print(f"[train] Final val loss: {val_loss:.4f}  acc: {val_acc:.3f}")
-    if val_loss < best_val:
+    if val_acc > best_val_acc:
         torch.save(query_enc.state_dict(), MODEL_DIR / "model2_scorer.pt")
+        print(f"  *** best acc={val_acc:.3f} (final) → checkpoint updated ***")
     torch.save(query_enc.state_dict(), MODEL_DIR / "model2_scorer_final.pt")
-    print(f"[train] Saved → {MODEL_DIR}/model2_scorer_final.pt")
+    print(f"[train] Saved final → {MODEL_DIR}/model2_scorer_final.pt")
 
 
 # ── Eval only ──────────────────────────────────────────────────────────────────
@@ -445,15 +434,15 @@ def eval_only(args):
     id_to_text  = {c["chunk_id"]: c["text"] for c in val_corpus}
     val_quints  = build_scoring_quintuples(val_corpus, val_queries)
 
-    q_tokenizer  = BertTokenizerFast.from_pretrained(BERT_FALLBACK)
-    ab_tokenizer = BertTokenizerFast.from_pretrained(BERT_FALLBACK)
+    q_tokenizer  = BertTokenizerFast.from_pretrained(BERT_NAME)
+    ab_tokenizer = BertTokenizerFast.from_pretrained(BERT_NAME)
     collate      = make_collate_fn(q_tokenizer, ab_tokenizer)
     val_loader   = DataLoader(
         ScoringDataset(val_quints, id_to_text),
         batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate
     )
 
-    query_enc = ColBERTQueryEncoder().to(DEVICE)
+    query_enc = QueryEncoder().to(DEVICE)
     query_enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     print(f"[eval] Loaded checkpoint from {ckpt}")
 
@@ -473,7 +462,7 @@ def eval_only(args):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ColBERTScorer (Model 2)")
+    parser = argparse.ArgumentParser(description="Train QueryScorer (Model 2)")
     parser.add_argument("--max_examples", type=int, default=None,
                         help="Cap MuSiQue training examples (None = all ~19.9K)")
     parser.add_argument("--eval_only", action="store_true",
