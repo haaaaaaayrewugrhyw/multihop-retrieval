@@ -58,7 +58,7 @@ BERT_NAME   = "bert-base-uncased"
 PROJ_DIM    = 128        # ColBERT-style token projection dimension
 DROPOUT     = 0.1
 MARGIN      = 0.2        # cosine margin for contrastive loss
-BATCH_SIZE  = 8          # examples per step (each → 1 pos + 3 neg BERT passes)
+BATCH_SIZE  = 32         # increased from 8 — needs ≥8 has_c examples/batch for InfoNCE
 LR          = 2e-5       # standard for BERT fine-tuning
 EPOCHS      = 3
 EVAL_EVERY  = 200
@@ -66,13 +66,21 @@ MAX_LEN_AB  = 256        # max tokens for [CLS] A [SEP] B [SEP]
 MAX_LEN_C   = 128        # max tokens for standalone C encoding
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Loss weights — three-component IB-inspired objective
-# L_content:    complement must encode B's information  (prevents collapse)
-# L_orthogonal: complement must NOT encode A's information  (prevents shortcut)
-# L_chain:      complement must point toward C  (chain supervision)
-LAMBDA_CONTENT    = 1.0
+# Loss weights
+# L_next (InfoNCE): complement(A,B) must predict C — applied to has_c examples only.
+#   Replaces old L_content for non-final hops. Makes edge vectors point toward the
+#   next hop so hop-2+ FAISS navigation actually finds C.
+# L_chain:      among edges from A, the correct one predicts C better than wrong ones.
+#   Discriminative counterpart to L_next. Increased weight now that L_content no longer
+#   dominates.
+# L_content:    weak regression toward B — applied to no_c (final-hop) examples only.
+#   Keeps final-hop edge vectors from becoming random; weight reduced from 1.0 to 0.2.
+# L_orthogonal: complement must NOT encode A's content — all examples.
+LAMBDA_NEXT       = 1.5
+LAMBDA_CHAIN      = 1.0
+LAMBDA_CONTENT    = 0.2
 LAMBDA_ORTHOGONAL = 0.3
-LAMBDA_CHAIN      = 0.5
+TEMPERATURE       = 0.1  # InfoNCE softmax temperature
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -165,22 +173,24 @@ def mean_pool(tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
 
 class ChainContrastiveLoss(nn.Module):
     """
-    Three-component IB-inspired loss for query-agnostic complement training.
+    Redesigned loss for next-hop prediction.
 
-    L_content:    1 - cos(complement(A,B_pos), standalone_B)
-                  Forces complement to encode B's information.
-                  Prevents the model from collapsing to a zero/random vector.
+    L_next (InfoNCE, has_c only):
+        complement(A,B) must be closer to its own C than to other C's in the batch.
+        Forces edge vectors to predict the specific next-hop passage.
+        Replaces old L_content for non-final hops — fixing the cosine=0.99 collapse.
 
-    L_orthogonal: |cos(complement(A,B_pos), standalone_A)|
-                  Forces complement to differ from A.
-                  Prevents the shortcut of ignoring A and just encoding B.
+    L_chain (margin ranking, has_c only):
+        Among edges from A, the correct one (A→B_pos) predicts C better than
+        wrong ones (A→B_neg). Discriminative signal on top of L_next.
 
-    L_chain:      C-anchor margin loss — complement(A,B_pos) closer to C
-                  than complement(A,B_neg). Chain supervision signal.
+    L_content (regression, no_c only, weak):
+        complement(A,B) ≈ encode_passage(B) for final-hop pairs (no C exists).
+        Prevents final-hop edge vectors from being random. Weight reduced to 0.2.
 
-    Total: LAMBDA_CONTENT * L_content
-         + LAMBDA_ORTHOGONAL * L_orthogonal
-         + LAMBDA_CHAIN * L_chain
+    L_orthogonal (all examples):
+        |cos(complement, standalone_A)| → 0.
+        Prevents complement from collapsing to A (the shortcut).
     """
 
     def __init__(self, margin: float = MARGIN):
@@ -193,38 +203,56 @@ class ChainContrastiveLoss(nn.Module):
         b_pad_mask_pos:  torch.Tensor,        # [B, n_pos] bool
         complement_negs: List[torch.Tensor],  # each [B, n_neg, 128]
         b_pad_masks_neg: List[torch.Tensor],  # each [B, n_neg] bool
-        pool_c:          torch.Tensor,        # [n_c, 128]  standalone C (only rows where has_c)
+        pool_c:          torch.Tensor,        # [n_c, 128]  standalone C (has_c rows only)
         pool_a:          torch.Tensor,        # [B, 128]  standalone A
         pool_b:          torch.Tensor,        # [B, 128]  standalone B_pos
         has_c:           torch.Tensor,        # [B] bool — True when C is available
     ) -> torch.Tensor:
 
         pool_pos = mean_pool(complement_pos, b_pad_mask_pos)   # [B, 128]
+        dev      = complement_pos.device
 
-        # L_content: complement must encode B's content
-        l_content = (1.0 - (pool_pos * pool_b).sum(-1)).mean()
-
-        # L_orthogonal: complement must NOT encode A's content
+        # ── L_orthogonal (all examples) ───────────────────────────────────────
         l_orthogonal = (pool_pos * pool_a).sum(-1).abs().mean()
 
-        # L_chain: C-anchor margin ranking loss — only for examples that have C
+        # ── has_c branch: L_next (InfoNCE) + L_chain ─────────────────────────
         if pool_c is not None and has_c.any():
-            pool_pos_c = pool_pos[has_c]                       # [n_c, 128]
-            score_pos  = (pool_pos_c * pool_c).sum(-1)         # [n_c]
-            l_chain = torch.zeros(1, device=complement_pos.device)
-            count = 0
+            pool_pos_c = pool_pos[has_c]          # [n_c, 128]
+            n_c        = pool_pos_c.shape[0]
+
+            # L_next — InfoNCE: complement(A,B_i) must be closest to C_i
+            # logits[i,j] = dot(complement_i, C_j) / τ
+            logits = (pool_pos_c @ pool_c.T) / TEMPERATURE   # [n_c, n_c]
+            labels = torch.arange(n_c, device=dev)
+            l_next = F.cross_entropy(logits, labels)
+
+            # L_chain — margin ranking: correct edge predicts C better than wrong edges
+            score_pos = (pool_pos_c * pool_c).sum(-1)         # [n_c]
+            l_chain   = torch.zeros(1, device=dev)
+            count     = 0
             for comp_neg, mask_neg in zip(complement_negs, b_pad_masks_neg):
                 pool_neg_c = mean_pool(comp_neg, mask_neg)[has_c]   # [n_c, 128]
-                score_neg  = (pool_neg_c * pool_c).sum(-1)           # [n_c]
+                score_neg  = (pool_neg_c * pool_c).sum(-1)
                 l_chain    = l_chain + F.relu(self.margin + score_neg - score_pos).mean()
                 count += 1
             l_chain = l_chain / max(count, 1)
         else:
-            l_chain = torch.zeros(1, device=complement_pos.device)
+            l_next  = torch.zeros(1, device=dev)
+            l_chain = torch.zeros(1, device=dev)
 
-        return (LAMBDA_CONTENT    * l_content
-              + LAMBDA_ORTHOGONAL * l_orthogonal
-              + LAMBDA_CHAIN      * l_chain)
+        # ── no_c branch: weak L_content (final-hop stability) ────────────────
+        no_c = ~has_c
+        if no_c.any():
+            pool_pos_nc = pool_pos[no_c]
+            pool_b_nc   = pool_b[no_c]
+            l_content   = (1.0 - (pool_pos_nc * pool_b_nc).sum(-1)).mean()
+        else:
+            l_content = torch.zeros(1, device=dev)
+
+        return (LAMBDA_NEXT       * l_next
+              + LAMBDA_CHAIN      * l_chain
+              + LAMBDA_CONTENT    * l_content
+              + LAMBDA_ORTHOGONAL * l_orthogonal)
 
 
 # ── Tokenizer helpers ──────────────────────────────────────────────────────────
