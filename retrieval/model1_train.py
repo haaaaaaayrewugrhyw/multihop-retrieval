@@ -58,7 +58,7 @@ BERT_NAME   = "bert-base-uncased"
 PROJ_DIM    = 128        # ColBERT-style token projection dimension
 DROPOUT     = 0.1
 MARGIN      = 0.2        # cosine margin for contrastive loss
-BATCH_SIZE  = 16         # T4 OOMs at 32 (6 BERT graphs in memory); ~4 has_c/batch → 3 InfoNCE negs, acceptable
+BATCH_SIZE  = 32         # gradient checkpointing reduces activation memory ~5×, so 32 fits on T4
 LR          = 2e-5       # standard for BERT fine-tuning
 EPOCHS      = 3
 EVAL_EVERY  = 200
@@ -482,6 +482,7 @@ def train(args) -> ComplementEncoder:
     )
 
     model     = ComplementEncoder().to(DEVICE)
+    model.bert.gradient_checkpointing_enable()   # recompute activations on backward; ~5× less activation memory
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
     total_steps = len(train_loader) * EPOCHS
     scheduler = torch.optim.lr_scheduler.LinearLR(
