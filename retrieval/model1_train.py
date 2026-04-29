@@ -5,29 +5,30 @@ Architecture:
     Joint BERT encoding of [CLS] A [SEP] B [SEP].
     BERT self-attention attends across A and B at every layer, so B token
     representations naturally encode "B's content conditioned on A."
-    B-side token matrix is extracted and projected to 128-dim (ColBERT style).
+    B-side token matrix is extracted, projected to 128-dim, mean-pooled and
+    L2-normalised → complement(A,B).
 
-Why joint encoding instead of pooled vectors:
-    Pooling A and B to single vectors before comparison loses token-level structure.
-    Joint BERT encoding computes the A↔B interaction through 12 attention layers —
-    this is the deep equivalent of the ESIM residual (B - aligned_A), not a shallow
-    single-layer approximation.
+What complement(A,B) represents:
+    "The additional information you gain by going from passage A to passage B."
+    A semantic delta vector, pre-computable offline.
 
-Loss — Chain Contrastive (C-anchor):
-    Trained on 3/4-hop examples only (those with a known next-hop C).
-    For each directed pair (A → B_pos) with next-hop C:
-        mean_pool(complement(A, B_pos)) should be closer to mean_pool(C_standalone)
-        than mean_pool(complement(A, B_neg_i)) is, for all in-example distractors.
-    This is query-agnostic: C serves as the supervision target, not Q.
-    2-hop examples (no C) are used by Model 2 training instead.
+Loss — DPR-style biencoder (query-aligned hop scoring):
+    For each directed hop pair (Q, A → B_pos, A → B_neg_1..k):
+        dot(query_vec(Q), complement(A, B_pos))
+            > dot(query_vec(Q), complement(A, B_neg_k)) + margin
 
-Training data: MuSiQue train split, 3/4-hop questions only (~7K questions → ~56K instances)
-    Chain order from question_decomposition[i]['paragraph_support_idx'].
-    Hard negatives: in-example distractors (already topically challenging).
+    Two components:
+      L_inbatch: InfoNCE over in-batch positives — q_i retrieves comp_pos_i
+                 among all (B-1) other complements in the batch.
+                 Temperature=0.07 (DPR standard). Up to 31 negatives at batch=32.
+      L_hard:    Margin ranking against 3 in-example distractors per hop.
+
+    Uses ALL 26,675 hop pairs (not just the 6,737 with a known C-anchor).
+    Query text Q provides direct training signal for what the complement should score.
 
 Usage:
-    python model1_train.py --max_examples 300    # smoke test on Colab/local
-    python model1_train.py                        # full training (Colab recommended)
+    python model1_train.py --max_examples 300    # smoke test
+    python model1_train.py                        # full training on Kaggle T4
     python model1_train.py --eval_only            # evaluate saved checkpoint
 
 Output:
@@ -55,32 +56,22 @@ CACHE_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 BERT_NAME   = "bert-base-uncased"
-PROJ_DIM    = 128        # ColBERT-style token projection dimension
+PROJ_DIM    = 128
 DROPOUT     = 0.1
-MARGIN      = 0.2        # cosine margin for contrastive loss
-BATCH_SIZE  = 32         # gradient checkpointing reduces activation memory ~5×, so 32 fits on T4
-LR          = 2e-5       # standard for BERT fine-tuning
+MARGIN      = 0.2
+BATCH_SIZE  = 32         # gradient checkpointing keeps this within T4 memory
+LR          = 2e-5
 EPOCHS      = 3
 EVAL_EVERY  = 200
-MAX_LEN_AB  = 256        # max tokens for [CLS] A [SEP] B [SEP]
-MAX_LEN_C   = 128        # max tokens for standalone C encoding
+MAX_LEN_AB  = 256        # [CLS] A [SEP] B [SEP]
+MAX_LEN_Q   = 128        # standalone query
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Loss weights
-# L_next (InfoNCE): complement(A,B) must predict C — applied to has_c examples only.
-#   Replaces old L_content for non-final hops. Makes edge vectors point toward the
-#   next hop so hop-2+ FAISS navigation actually finds C.
-# L_chain:      among edges from A, the correct one predicts C better than wrong ones.
-#   Discriminative counterpart to L_next. Increased weight now that L_content no longer
-#   dominates.
-# L_content:    weak regression toward B — applied to no_c (final-hop) examples only.
-#   Keeps final-hop edge vectors from becoming random; weight reduced from 1.0 to 0.2.
-# L_orthogonal: complement must NOT encode A's content — all examples.
-LAMBDA_NEXT       = 1.5
-LAMBDA_CHAIN      = 1.0
-LAMBDA_CONTENT    = 0.2
-LAMBDA_ORTHOGONAL = 0.3
-TEMPERATURE       = 0.1  # InfoNCE softmax temperature
+# L_inbatch: in-batch InfoNCE — q_i retrieves its own complement among all batch comps
+# L_hard:    margin ranking against 3 in-example hard negatives
+TEMPERATURE = 0.07   # DPR standard; sharper than 0.1 but not overfit-prone at this scale
+LAMBDA_HARD = 0.5    # weight of hard-negative margin loss
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -127,13 +118,12 @@ class ComplementEncoder(nn.Module):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Encode a standalone passage (used for C in the contrastive loss).
-        Returns mean-pooled, L2-normalised vector [B, PROJ_DIM].
+        Encode a standalone passage or query → mean-pooled L2-normalised [B, PROJ_DIM].
+        Used for: query encoding (Q), passage encoding for graph/FAISS index.
         """
         out    = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         hidden = out.last_hidden_state                    # [B, seq_len, 768]
         proj   = F.normalize(self.proj(hidden), dim=-1)  # [B, seq_len, PROJ_DIM]
-        # Mean pool over non-padding tokens
         mask_f = attention_mask.unsqueeze(-1).float()     # [B, seq_len, 1]
         pool   = (proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1e-9)
         return F.normalize(pool, dim=-1)                  # [B, PROJ_DIM]
@@ -171,26 +161,17 @@ def mean_pool(tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
 
 # ── Loss ───────────────────────────────────────────────────────────────────────
 
-class ChainContrastiveLoss(nn.Module):
+class HopContrastiveLoss(nn.Module):
     """
-    Redesigned loss for next-hop prediction.
+    DPR-style biencoder loss for complement(A,B) ↔ query_vec(Q) alignment.
 
-    L_next (InfoNCE, has_c only):
-        complement(A,B) must be closer to its own C than to other C's in the batch.
-        Forces edge vectors to predict the specific next-hop passage.
-        Replaces old L_content for non-final hops — fixing the cosine=0.99 collapse.
+    L_inbatch (InfoNCE):
+        q_i should retrieve complement(A_i, B_pos_i) among all complements in the batch.
+        With batch=32 this gives up to 31 in-batch negatives per anchor.
 
-    L_chain (margin ranking, has_c only):
-        Among edges from A, the correct one (A→B_pos) predicts C better than
-        wrong ones (A→B_neg). Discriminative signal on top of L_next.
-
-    L_content (regression, no_c only, weak):
-        complement(A,B) ≈ encode_passage(B) for final-hop pairs (no C exists).
-        Prevents final-hop edge vectors from being random. Weight reduced to 0.2.
-
-    L_orthogonal (all examples):
-        |cos(complement, standalone_A)| → 0.
-        Prevents complement from collapsing to A (the shortcut).
+    L_hard (margin ranking):
+        dot(q, complement(A, B_pos)) > dot(q, complement(A, B_neg_k)) + margin
+        for each of the 3 in-example hard negative passages.
     """
 
     def __init__(self, margin: float = MARGIN):
@@ -199,60 +180,27 @@ class ChainContrastiveLoss(nn.Module):
 
     def forward(
         self,
-        complement_pos:  torch.Tensor,        # [B, n_pos, 128]
-        b_pad_mask_pos:  torch.Tensor,        # [B, n_pos] bool
-        complement_negs: List[torch.Tensor],  # each [B, n_neg, 128]
-        b_pad_masks_neg: List[torch.Tensor],  # each [B, n_neg] bool
-        pool_c:          torch.Tensor,        # [n_c, 128]  standalone C (has_c rows only)
-        pool_a:          torch.Tensor,        # [B, 128]  standalone A
-        pool_b:          torch.Tensor,        # [B, 128]  standalone B_pos
-        has_c:           torch.Tensor,        # [B] bool — True when C is available
+        q_vecs:    torch.Tensor,        # [B, 128]  query vectors
+        comp_pos:  torch.Tensor,        # [B, 128]  complement(A, B_pos)
+        comp_negs: List[torch.Tensor],  # each [B, 128]  complement(A, B_neg_k)
     ) -> torch.Tensor:
+        B   = q_vecs.shape[0]
+        dev = q_vecs.device
 
-        pool_pos = mean_pool(complement_pos, b_pad_mask_pos)   # [B, 128]
-        dev      = complement_pos.device
+        # L_inbatch — InfoNCE: q_i should retrieve comp_pos_i
+        logits = (q_vecs @ comp_pos.T) / TEMPERATURE    # [B, B]
+        labels = torch.arange(B, device=dev)
+        l_inbatch = F.cross_entropy(logits, labels)
 
-        # ── L_orthogonal (all examples) ───────────────────────────────────────
-        l_orthogonal = (pool_pos * pool_a).sum(-1).abs().mean()
+        # L_hard — margin ranking against in-example hard negatives
+        score_pos = (q_vecs * comp_pos).sum(-1)         # [B]
+        l_hard    = torch.zeros(1, device=dev)
+        for comp_neg in comp_negs:
+            score_neg = (q_vecs * comp_neg).sum(-1)
+            l_hard    = l_hard + F.relu(self.margin + score_neg - score_pos).mean()
+        l_hard = l_hard / max(len(comp_negs), 1)
 
-        # ── has_c branch: L_next (InfoNCE) + L_chain ─────────────────────────
-        if pool_c is not None and has_c.any():
-            pool_pos_c = pool_pos[has_c]          # [n_c, 128]
-            n_c        = pool_pos_c.shape[0]
-
-            # L_next — InfoNCE: complement(A,B_i) must be closest to C_i
-            # logits[i,j] = dot(complement_i, C_j) / τ
-            logits = (pool_pos_c @ pool_c.T) / TEMPERATURE   # [n_c, n_c]
-            labels = torch.arange(n_c, device=dev)
-            l_next = F.cross_entropy(logits, labels)
-
-            # L_chain — margin ranking: correct edge predicts C better than wrong edges
-            score_pos = (pool_pos_c * pool_c).sum(-1)         # [n_c]
-            l_chain   = torch.zeros(1, device=dev)
-            count     = 0
-            for comp_neg, mask_neg in zip(complement_negs, b_pad_masks_neg):
-                pool_neg_c = mean_pool(comp_neg, mask_neg)[has_c]   # [n_c, 128]
-                score_neg  = (pool_neg_c * pool_c).sum(-1)
-                l_chain    = l_chain + F.relu(self.margin + score_neg - score_pos).mean()
-                count += 1
-            l_chain = l_chain / max(count, 1)
-        else:
-            l_next  = torch.zeros(1, device=dev)
-            l_chain = torch.zeros(1, device=dev)
-
-        # ── no_c branch: weak L_content (final-hop stability) ────────────────
-        no_c = ~has_c
-        if no_c.any():
-            pool_pos_nc = pool_pos[no_c]
-            pool_b_nc   = pool_b[no_c]
-            l_content   = (1.0 - (pool_pos_nc * pool_b_nc).sum(-1)).mean()
-        else:
-            l_content = torch.zeros(1, device=dev)
-
-        return (LAMBDA_NEXT       * l_next
-              + LAMBDA_CHAIN      * l_chain
-              + LAMBDA_CONTENT    * l_content
-              + LAMBDA_ORTHOGONAL * l_orthogonal)
+        return l_inbatch + LAMBDA_HARD * l_hard
 
 
 # ── Tokenizer helpers ──────────────────────────────────────────────────────────
@@ -287,9 +235,9 @@ def tokenize_ab_pairs(
 def tokenize_passages(
     texts: List[str],
     tokenizer: BertTokenizerFast,
-    max_length: int = MAX_LEN_C,
+    max_length: int = MAX_LEN_Q,
 ) -> Dict[str, torch.Tensor]:
-    """Tokenise standalone passages (used for C encoding)."""
+    """Tokenise standalone passages or queries."""
     return tokenizer(
         text=texts,
         max_length=max_length, truncation=True,
@@ -302,28 +250,24 @@ def tokenize_passages(
 class ChainDataset(Dataset):
     """
     Wraps chain quadruples for Model 1 training.
-    Only uses examples where chunk_c_id is not None (3/4-hop chains).
+    Uses ALL hop pairs (including 2-hop final hops) — every pair has a query Q.
     """
 
     def __init__(self, quadruples: List[Dict], id_to_text: Dict[str, str]):
-        self.data       = quadruples          # all hops — L_chain skipped when chunk_c_id is None
+        self.data       = quadruples
         self.id_to_text = id_to_text
-        with_c    = sum(1 for q in quadruples if q.get("chunk_c_id") is not None)
-        without_c = len(quadruples) - with_c
-        print(f"[ChainDataset] {len(self.data):,} examples "
-              f"({with_c:,} with C-anchor, {without_c:,} without)")
+        print(f"[ChainDataset] {len(self.data):,} examples")
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict:
         q = self.data[idx]
-        c_id = q.get("chunk_c_id")
         return {
+            "text_q":     q["query_text"],
             "text_a":     self.id_to_text[q["chunk_a_id"]],
             "text_b_pos": self.id_to_text[q["chunk_b_pos_id"]],
             "text_b_negs":[self.id_to_text[nid] for nid in q["chunk_b_neg_ids"]],
-            "text_c":     self.id_to_text[c_id] if c_id else None,
         }
 
 
@@ -331,41 +275,31 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
     """Return a collate_fn that tokenises a batch of ChainDataset items."""
 
     def collate(batch: List[Dict]) -> Dict[str, object]:
-        texts_a     = [x["text_a"]     for x in batch]
-        texts_b_pos = [x["text_b_pos"] for x in batch]
-        n_negs      = len(batch[0]["text_b_negs"])
+        texts_q      = [x["text_q"]     for x in batch]
+        texts_a      = [x["text_a"]     for x in batch]
+        texts_b_pos  = [x["text_b_pos"] for x in batch]
+        n_negs       = len(batch[0]["text_b_negs"])
         texts_b_negs = [[x["text_b_negs"][k] for x in batch] for k in range(n_negs)]
 
+        # Query: standalone encoding
+        enc_q = tokenize_passages(texts_q, tokenizer, max_length=MAX_LEN_Q)
+
+        # Complement pairs
         enc_pos, b_mask_pos = tokenize_ab_pairs(texts_a, texts_b_pos, tokenizer)
 
-        enc_negs   = []
+        enc_negs    = []
         b_masks_neg = []
         for k in range(n_negs):
             enc_k, mask_k = tokenize_ab_pairs(texts_a, texts_b_negs[k], tokenizer)
             enc_negs.append(enc_k)
             b_masks_neg.append(mask_k)
 
-        # C is only available for non-last hops (3/4-hop chains)
-        has_c_list = [x["text_c"] is not None for x in batch]
-        has_c      = torch.tensor(has_c_list, dtype=torch.bool)
-        if any(has_c_list):
-            texts_c_valid = [x["text_c"] for x in batch if x["text_c"] is not None]
-            enc_c = tokenize_passages(texts_c_valid, tokenizer)
-        else:
-            enc_c = None
-
-        enc_a = tokenize_passages(texts_a,     tokenizer)  # standalone A for L_orthogonal
-        enc_b = tokenize_passages(texts_b_pos, tokenizer)  # standalone B for L_content
-
         return {
+            "enc_q":       enc_q,
             "enc_pos":     enc_pos,
             "b_mask_pos":  b_mask_pos,
             "enc_negs":    enc_negs,
             "b_masks_neg": b_masks_neg,
-            "enc_c":       enc_c,
-            "has_c":       has_c,
-            "enc_a":       enc_a,
-            "enc_b":       enc_b,
         }
 
     return collate
@@ -375,59 +309,59 @@ def make_collate_fn(tokenizer: BertTokenizerFast):
 
 def _forward_batch(model, batch, device):
     """
-    Run one forward pass over a collated batch.
-    Returns (complement_pos, b_pad_mask_pos, complement_negs, b_pad_masks_neg,
-             pool_c, pool_a, pool_b, has_c).
-    pool_c contains embeddings only for examples where has_c is True.
+    Five forward passes per batch:
+      1. encode_passage(Q)          → q_vecs     [B, 128]
+      2. complement(A, B_pos)       → comp_pos   [B, 128]
+      3-5. complement(A, B_neg_k)   → comp_negs  list of [B, 128]
     """
     def to(enc):
         return {k: v.to(device) for k, v in enc.items()}
 
+    # Query vectors
+    eq     = to(batch["enc_q"])
+    q_vecs = model.encode_passage(eq["input_ids"], eq["attention_mask"])  # [B, 128]
+
+    # Positive complement
     ep  = to(batch["enc_pos"])
     bmp = batch["b_mask_pos"].to(device)
-
-    comp_pos, pad_mask_pos = model(
+    comp_pos_tok, pad_mask_pos = model(
         ep["input_ids"], ep["attention_mask"], ep["token_type_ids"], bmp
     )
+    comp_pos = mean_pool(comp_pos_tok, pad_mask_pos)  # [B, 128]
 
-    comp_negs     = []
-    pad_masks_neg = []
+    # Negative complements
+    comp_negs = []
     for enc_k, mask_k in zip(batch["enc_negs"], batch["b_masks_neg"]):
         ek = to(enc_k)
         mk = mask_k.to(device)
         cn, pm = model(ek["input_ids"], ek["attention_mask"], ek["token_type_ids"], mk)
-        comp_negs.append(cn)
-        pad_masks_neg.append(pm)
+        comp_negs.append(mean_pool(cn, pm))  # [B, 128]
 
-    has_c = batch["has_c"].to(device)
-    if batch["enc_c"] is not None and has_c.any():
-        ec = to(batch["enc_c"])
-        pc = model.encode_passage(ec["input_ids"], ec["attention_mask"])  # [n_c, 128]
-    else:
-        pc = None
-
-    ea = to(batch["enc_a"])
-    pa = model.encode_passage(ea["input_ids"], ea["attention_mask"])
-
-    eb = to(batch["enc_b"])
-    pb = model.encode_passage(eb["input_ids"], eb["attention_mask"])
-
-    return comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pc, pa, pb, has_c
+    return q_vecs, comp_pos, comp_negs
 
 
-def validate(model, val_loader, criterion, device, max_steps=100) -> float:
+def validate(model, val_loader, device, max_steps=100) -> float:
+    """
+    Returns ranking accuracy: fraction of examples where
+    dot(q, comp_pos) > dot(q, comp_neg_k) for ALL k.
+    A well-trained model should reach >65% on unseen val hops.
+    """
     model.eval()
-    total, n = 0.0, 0
+    correct, total = 0, 0
     with torch.no_grad():
-        for batch in val_loader:
-            cp, mp, cns, mns, pc, pa, pb, hc = _forward_batch(model, batch, device)
-            loss = criterion(cp, mp, cns, mns, pc, pa, pb, hc)
-            total += loss.item()
-            n     += 1
-            if n >= max_steps:
+        for i, batch in enumerate(val_loader):
+            q_vecs, comp_pos, comp_negs = _forward_batch(model, batch, device)
+            score_pos  = (q_vecs * comp_pos).sum(-1)  # [B]
+            all_correct = torch.ones(score_pos.shape[0], dtype=torch.bool, device=device)
+            for comp_neg in comp_negs:
+                score_neg   = (q_vecs * comp_neg).sum(-1)
+                all_correct = all_correct & (score_pos > score_neg)
+            correct += all_correct.sum().item()
+            total   += score_pos.shape[0]
+            if i + 1 >= max_steps:
                 break
     model.train()
-    return total / max(n, 1)
+    return correct / max(total, 1)
 
 
 # ── Main Training Loop ─────────────────────────────────────────────────────────
@@ -437,6 +371,7 @@ def train(args) -> ComplementEncoder:
     print(f"[train] BERT     : {BERT_NAME}")
     print(f"[train] proj_dim : {PROJ_DIM}  margin : {MARGIN}")
     print(f"[train] batch    : {BATCH_SIZE}  lr : {LR}  epochs : {EPOCHS}")
+    print(f"[train] loss     : in-batch InfoNCE (T={TEMPERATURE}) + hard-neg margin (λ={LAMBDA_HARD})")
 
     from data_loader import load_musique, build_chain_quadruples
 
@@ -449,7 +384,6 @@ def train(args) -> ComplementEncoder:
         split="validation", max_examples=500, cache=True, shuffle=True
     )
 
-    # Build chunk_id → text lookup (shared across train + val)
     id_to_text: Dict[str, str] = {
         c["chunk_id"]: c["text"] for c in train_corpus + val_corpus
     }
@@ -465,11 +399,7 @@ def train(args) -> ComplementEncoder:
     val_ds   = ChainDataset(val_quads,   id_to_text)
 
     if len(train_ds) == 0:
-        raise RuntimeError(
-            "No 3/4-hop training examples found. "
-            "Check that MuSiQue train data includes multi-hop chains "
-            "and chain_chunk_ids are populated (run data_loader.py smoke test)."
-        )
+        raise RuntimeError("No training examples found. Check MuSiQue data.")
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -482,19 +412,19 @@ def train(args) -> ComplementEncoder:
     )
 
     model     = ComplementEncoder().to(DEVICE)
-    model.bert.gradient_checkpointing_enable()   # recompute activations on backward; ~5× less activation memory
+    model.bert.gradient_checkpointing_enable()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
     total_steps = len(train_loader) * EPOCHS
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_steps
     )
-    criterion = ChainContrastiveLoss(margin=MARGIN)
+    criterion = HopContrastiveLoss(margin=MARGIN)
 
-    best_val  = float("inf")
+    best_val  = 0.0   # maximise accuracy
     step      = 0
     running   = 0.0
 
-    print(f"[train] {len(train_ds):,} 3/4-hop train examples | {len(val_ds):,} val examples")
+    print(f"[train] {len(train_ds):,} hop pairs | {len(val_ds):,} val examples")
     print(f"[train] {len(train_loader):,} steps/epoch × {EPOCHS} epochs = {total_steps:,} total steps")
 
     for epoch in range(1, EPOCHS + 1):
@@ -502,11 +432,8 @@ def train(args) -> ComplementEncoder:
         t0 = time.time()
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}"):
-            comp_pos, pad_mask_pos, comp_negs, pad_masks_neg, pool_c, pool_a, pool_b, has_c = \
-                _forward_batch(model, batch, DEVICE)
-
-            loss = criterion(comp_pos, pad_mask_pos, comp_negs, pad_masks_neg,
-                             pool_c, pool_a, pool_b, has_c)
+            q_vecs, comp_pos, comp_negs = _forward_batch(model, batch, DEVICE)
+            loss = criterion(q_vecs, comp_pos, comp_negs)
 
             optimizer.zero_grad()
             loss.backward()
@@ -519,24 +446,24 @@ def train(args) -> ComplementEncoder:
 
             if step % EVAL_EVERY == 0:
                 avg_train = running / EVAL_EVERY
-                val_loss  = validate(model, val_loader, criterion, DEVICE)
+                val_acc   = validate(model, val_loader, DEVICE)
                 running   = 0.0
                 print(
-                    f"  step {step:>5} | train {avg_train:.4f} | val {val_loss:.4f}"
+                    f"  step {step:>5} | train_loss {avg_train:.4f} | val_acc {val_acc:.4f}"
                     f" | lr {scheduler.get_last_lr()[0]:.2e}"
                 )
-                if val_loss < best_val:
-                    best_val = val_loss
+                if val_acc > best_val:
+                    best_val = val_acc
                     torch.save(model.state_dict(), MODEL_DIR / "model1_complement.pt")
-                    print(f"  *** best val={val_loss:.4f} → checkpoint saved ***")
+                    print(f"  *** best val_acc={val_acc:.4f} → checkpoint saved ***")
 
         elapsed = time.time() - t0
         print(f"Epoch {epoch} done in {elapsed:.0f}s")
 
     # Final validation pass
-    val_loss = validate(model, val_loader, criterion, DEVICE, max_steps=999)
-    print(f"[train] Final val loss: {val_loss:.4f}")
-    if val_loss < best_val:
+    val_acc = validate(model, val_loader, DEVICE, max_steps=999)
+    print(f"[train] Final val_acc: {val_acc:.4f}")
+    if val_acc > best_val:
         torch.save(model.state_dict(), MODEL_DIR / "model1_complement.pt")
         print("  *** best val checkpoint updated ***")
 
@@ -548,7 +475,7 @@ def train(args) -> ComplementEncoder:
 # ── Evaluation helper ──────────────────────────────────────────────────────────
 
 def eval_only(args):
-    """Quick sanity check: load checkpoint and print val loss."""
+    """Load checkpoint and print val ranking accuracy."""
     from data_loader import load_musique, build_chain_quadruples
 
     ckpt = MODEL_DIR / "model1_complement.pt"
@@ -571,9 +498,8 @@ def eval_only(args):
     model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     print(f"[eval] Loaded checkpoint from {ckpt}")
 
-    criterion = ChainContrastiveLoss()
-    val_loss  = validate(model, val_loader, criterion, DEVICE, max_steps=999)
-    print(f"[eval] Val loss: {val_loss:.4f}")
+    val_acc = validate(model, val_loader, DEVICE, max_steps=999)
+    print(f"[eval] Val ranking accuracy: {val_acc:.4f}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -581,7 +507,7 @@ def eval_only(args):
 def main():
     parser = argparse.ArgumentParser(description="Train ComplementEncoder (Model 1)")
     parser.add_argument("--max_examples", type=int, default=None,
-                        help="Cap MuSiQue training examples (None = all ~17.5K)")
+                        help="Cap MuSiQue training examples (None = all)")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training; evaluate saved checkpoint on val set")
     args = parser.parse_args()

@@ -240,10 +240,11 @@ def build_chain_quadruples(
             chunk_c     = chain[i + 2] if i + 2 < len(chain) else None
 
             quadruples.append({
-                "chunk_a_id":     chunk_a,
-                "chunk_b_pos_id": chunk_b_pos,
+                "query_text":      q["question"],
+                "chunk_a_id":      chunk_a,
+                "chunk_b_pos_id":  chunk_b_pos,
                 "chunk_b_neg_ids": distractors,
-                "chunk_c_id":     chunk_c,
+                "chunk_c_id":      chunk_c,
             })
 
     pos = len(quadruples)
