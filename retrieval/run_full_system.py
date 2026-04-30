@@ -73,7 +73,6 @@ from baselines import DenseRetriever, BM25Retriever, reciprocal_rank_fusion
 from graph_builder import build_graph
 from mdr_baseline import MDRBaseline
 from model1_train import ComplementEncoder, mean_pool
-from model2_train import QueryEncoder
 
 CACHE_DIR   = Path(__file__).parent / "cache"
 MODEL_DIR   = Path(__file__).parent / "models"
@@ -219,18 +218,21 @@ def compute_edge_vectors(
 # ── Online query encoder ──────────────────────────────────────────────────────
 
 class LiveScorer:
-    """Encodes a query → q_vec [1, 128] in the M1 projection space."""
+    """
+    Encodes a query → q_vec [1, 128] using ComplementEncoder.encode_passage.
+    Model 1 and query encoder share the same checkpoint — no Model 2 needed.
+    """
 
     def __init__(
         self,
-        query_enc: QueryEncoder,
+        comp_enc:  ComplementEncoder,
         tokenizer: BertTokenizerFast,
         device:    str = DEVICE,
     ):
-        self.query_enc = query_enc
+        self.comp_enc  = comp_enc
         self.tokenizer = tokenizer
         self.device    = device
-        query_enc.eval()
+        comp_enc.eval()
 
     @torch.no_grad()
     def encode_query(self, question: str) -> torch.Tensor:
@@ -238,7 +240,7 @@ class LiveScorer:
             text=question, max_length=MAX_LEN_Q,
             truncation=True, padding="max_length", return_tensors="pt",
         )
-        return self.query_enc(
+        return self.comp_enc.encode_passage(
             enc["input_ids"].to(self.device),
             enc["attention_mask"].to(self.device),
         )   # [1, 128] L2-normalised
@@ -327,37 +329,36 @@ class FullGraphTraversal:
                             candidates[nbr_id] = (score, curr_id)
 
                 else:
-                    # ── Hop 2+: complement-directed FAISS ────────────────────
-                    # edge_vectors[(prev,curr)] ≈ encode_passage(next-hop)
-                    # → use as FAISS query to find next-hop candidates directly
-                    nav_vec = self.edge_vecs.get((prev_id, curr_id))
-                    if nav_vec is None:
-                        continue
+                    # ── Hop 2+: graph neighbors + query-directed FAISS ───────
+                    # complement(A,B) is trained to align with q_vec, not predict C.
+                    # So use q_np as FAISS query (MDR-style) and walk graph edges.
 
-                    nav_np  = nav_vec.reshape(1, -1).astype(np.float32)
-                    _, idxs = self.m1_index.search(nav_np, self.faiss_top_k * 3)
+                    # Primary: graph neighbors of curr_id scored with edge vectors
+                    for (nbr_id, _, _) in self.graph.get(curr_id, []):
+                        if nbr_id in retrieved_set or nbr_id == curr_id:
+                            continue
+                        ev = self.edge_vecs.get((curr_id, nbr_id))
+                        if ev is None:
+                            continue
+                        score = float(np.dot(q_np, ev))
+                        if nbr_id not in candidates or score > candidates[nbr_id][0]:
+                            candidates[nbr_id] = (score, curr_id)
 
-                    nbr_pool = [
-                        self.corpus_ids[i]
-                        for i in idxs[0]
-                        if 0 <= i < len(self.corpus_ids)
-                        and self.corpus_ids[i] not in retrieved_set
-                        and self.corpus_ids[i] != curr_id
-                    ][:self.faiss_top_k]
-
-                    for nbr_id in nbr_pool:
+                    # Fallback: FAISS with q_np for out-of-graph candidates
+                    _, idxs = self.m1_index.search(
+                        q_np.reshape(1, -1).astype(np.float32), self.faiss_top_k * 3
+                    )
+                    for i in idxs[0]:
+                        if not (0 <= i < len(self.corpus_ids)):
+                            continue
+                        nbr_id = self.corpus_ids[i]
+                        if nbr_id in retrieved_set or nbr_id == curr_id:
+                            continue
                         ev = self.edge_vecs.get((curr_id, nbr_id))
                         if ev is not None:
-                            # edge (curr→nbr) is in graph: use pre-computed vec
                             score = float(np.dot(q_np, ev))
                         else:
-                            # edge not in graph (FAISS-only candidate):
-                            # fall back to direct M1 embedding similarity
-                            nbr_idx = self.id_to_idx.get(nbr_id)
-                            if nbr_idx is None:
-                                continue
-                            score = float(np.dot(q_np, self.m1_embeddings[nbr_idx]))
-
+                            score = float(np.dot(q_np, self.m1_embeddings[i]))
                         if nbr_id not in candidates or score > candidates[nbr_id][0]:
                             candidates[nbr_id] = (score, curr_id)
 
@@ -499,8 +500,7 @@ def main():
 
     # ── Load trained models ───────────────────────────────────────────────────
     m1_ckpt    = MODEL_DIR / "model1_complement.pt"
-    m2_ckpt    = MODEL_DIR / "model2_scorer.pt"
-    has_models = m1_ckpt.exists() and m2_ckpt.exists()
+    has_models = m1_ckpt.exists()
 
     scorer    = None
     m1_emb    = None
@@ -513,13 +513,9 @@ def main():
         comp_enc.load_state_dict(torch.load(m1_ckpt, map_location=DEVICE))
         comp_enc.eval()
 
-        query_enc = QueryEncoder().to(DEVICE)
-        query_enc.load_state_dict(torch.load(m2_ckpt, map_location=DEVICE))
-        query_enc.eval()
-
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-        scorer    = LiveScorer(query_enc, tokenizer, DEVICE)
-        print("[runner] Model 1 + Model 2 loaded")
+        scorer    = LiveScorer(comp_enc, tokenizer, DEVICE)
+        print("[runner] Model 1 loaded (used for both passage encoding and query encoding)")
 
         # ── Step 1: M1 passage embeddings ────────────────────────────────────
         m1_emb = compute_m1_embeddings(
@@ -547,8 +543,7 @@ def main():
         print(f"[runner] Edge vectors: {len(edge_vecs):,} edges pre-computed")
 
     else:
-        missing = [str(p) for p in [m1_ckpt, m2_ckpt] if not p.exists()]
-        print(f"[runner] Missing checkpoints: {missing} — running MDR only")
+        print(f"[runner] Missing checkpoint: {m1_ckpt} — running MDR only")
         n, dim    = dense.index.ntotal, dense.index.d
         dense_emb = np.zeros((n, dim), dtype=np.float32)
         dense.index.reconstruct_n(0, n, dense_emb)
