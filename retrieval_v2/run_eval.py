@@ -11,13 +11,13 @@ Systems compared:
   3. FULL: FE graph + complement + FAISS — complement edge vectors, full system
 
 Key differences from the old pipeline:
-  - passage encoding  : model.encode_query(text)  [CLS → 128-dim]
-  - edge complement   : model.extract_complement(A, B)  [FakeEncoder → 128-dim]
-  - checkpoint file   : fakencoder_best.pt  (not model1_complement.pt)
+  - passage encoding  : model.encode_query(text)   [CLS -> 128-dim]
+  - edge complement   : model.extract_complement(A, B)  [FakeEncoder -> 128-dim]
+  - checkpoint file   : fakencoder_best.pt
 
 All offline embeddings are cached to retrieval_v2/cache/ after first run.
 
-Usage:
+Usage (as script):
   python run_eval.py                         # full 2417 dev queries
   python run_eval.py --max_examples 300      # quick 300-query smoke test
 """
@@ -25,16 +25,25 @@ Usage:
 import argparse
 import json
 import pickle
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# ── Path detection: works both as a script and inside a Jupyter cell ──────────
+# __file__ is defined when run as `python run_eval.py`
+# It is NOT defined when the code is exec'd inside a Kaggle/Jupyter cell.
+try:
+    _HERE = Path(__file__).resolve().parent
+except NameError:
+    _HERE = Path.cwd()   # fallback: use current working directory
+
+# ── faiss: auto-install if missing ────────────────────────────────────────────
 try:
     import faiss
 except ImportError:
-    import subprocess
-    subprocess.run(["pip", "install", "-q", "faiss-cpu"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "faiss-cpu"], check=True)
     import faiss
 
 import numpy as np
@@ -43,17 +52,17 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import BertTokenizerFast
 
-# ── Shared utilities from the sibling retrieval/ directory ───────────────────
-RETRIEVAL_DIR = Path(__file__).parent.parent / "retrieval"
-sys.path.insert(0, str(RETRIEVAL_DIR))
-sys.path.insert(0, str(Path(__file__).parent))
+# ── Shared utilities: sibling retrieval/ directory ────────────────────────────
+_RETRIEVAL_DIR = _HERE.parent / "retrieval"
+sys.path.insert(0, str(_RETRIEVAL_DIR))
+sys.path.insert(0, str(_HERE))
 
-from data_loader import load_musique
-from evaluate import evaluate_retriever, compare_systems          # retrieval/
-from baselines import DenseRetriever, BM25Retriever, reciprocal_rank_fusion  # retrieval/
-from graph_builder import build_graph                              # retrieval/
-from mdr_baseline import MDRBaseline                              # retrieval/
-from fakencoder_train import FakeEncoderModel, MAX_A_LEN, MAX_B_LEN, D_PROJ
+from data_loader import load_musique                                          # retrieval_v2/
+from evaluate   import evaluate_retriever, compare_systems                    # retrieval/
+from baselines  import DenseRetriever, BM25Retriever, reciprocal_rank_fusion  # retrieval/
+from graph_builder import build_graph                                          # retrieval/
+from mdr_baseline  import MDRBaseline                                         # retrieval/
+from fakencoder_train import FakeEncoderModel, MAX_A_LEN, MAX_B_LEN           # retrieval_v2/
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,9 +74,11 @@ FAISS_TOP_K  = 20
 ENC_BATCH    = 64    # passages per batch for encode_query
 COMP_BATCH   = 8     # (A,B) pairs per batch for extract_complement
 
-MODEL_DIR   = Path(__file__).parent / "models"
-CACHE_DIR   = Path(__file__).parent / "cache"
-RESULTS_DIR = Path(__file__).parent / "results"
+MODEL_DIR   = _HERE / "models"
+CACHE_DIR   = _HERE / "cache"
+RESULTS_DIR = _HERE / "results"
+MODEL_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
@@ -81,7 +92,7 @@ def compute_passage_embeddings(
     device:     str,
     cache_path: Optional[Path] = None,
 ) -> np.ndarray:
-    """encode_query(P) for every corpus chunk → [N, 128] float32."""
+    """encode_query(P) for every corpus chunk -> [N, 128] float32."""
     if cache_path and cache_path.exists():
         print(f"[pass_emb] Loading cache: {cache_path}")
         return np.load(str(cache_path))
@@ -107,7 +118,7 @@ def compute_passage_embeddings(
     print(f"[pass_emb] Done — shape {emb.shape}")
     if cache_path:
         np.save(str(cache_path), emb)
-        print(f"[pass_emb] Cached → {cache_path}")
+        print(f"[pass_emb] Cached -> {cache_path}")
     return emb
 
 
@@ -123,7 +134,7 @@ def compute_edge_vectors(
     cache_path: Optional[Path] = None,
 ) -> Dict[Tuple[str, str], np.ndarray]:
     """
-    extract_complement(A, B) for every directed graph edge → 128-dim vector.
+    extract_complement(A, B) for every directed graph edge -> 128-dim vector.
     Stored as {(a_id, b_id): np.array([128])} for instant dict lookup at query time.
     """
     if cache_path and cache_path.exists():
@@ -173,40 +184,40 @@ def compute_edge_vectors(
     if cache_path:
         with open(cache_path, "wb") as fh:
             pickle.dump(edge_vecs, fh)
-        print(f"[edge_vecs] Cached → {cache_path}")
+        print(f"[edge_vecs] Cached -> {cache_path}")
     return edge_vecs
 
 
 # ── Ablation: graph + direct passage cosine (no complement) ──────────────────
 
 class GraphDirectCosine:
-    """dot(q_vec, passage_emb[B]) — complement removed, direct sim only."""
+    """dot(q_vec, passage_emb[B]) — complement removed, direct similarity only."""
 
     def __init__(
         self,
-        model:        FakeEncoderModel,
-        graph:        Dict,
-        corpus:       List[Dict],
-        pass_emb:     np.ndarray,
-        tokenizer:    BertTokenizerFast,
-        bm25:         BM25Retriever,
-        dense:        DenseRetriever,
-        beam_width:   int   = BEAM_WIDTH,
-        max_hops:     int   = MAX_HOPS,
-        n_seeds:      int   = N_SEEDS,
-        stop_thresh:  float = STOP_THRESH,
+        model:       FakeEncoderModel,
+        graph:       Dict,
+        corpus:      List[Dict],
+        pass_emb:    np.ndarray,
+        tokenizer:   BertTokenizerFast,
+        bm25:        BM25Retriever,
+        dense:       DenseRetriever,
+        beam_width:  int   = BEAM_WIDTH,
+        max_hops:    int   = MAX_HOPS,
+        n_seeds:     int   = N_SEEDS,
+        stop_thresh: float = STOP_THRESH,
     ):
-        self.model      = model
-        self.graph      = graph
-        self.pass_emb   = pass_emb
-        self.tokenizer  = tokenizer
-        self.bm25       = bm25
-        self.dense      = dense
-        self.beam_width = beam_width
-        self.max_hops   = max_hops
-        self.n_seeds    = n_seeds
+        self.model       = model
+        self.graph       = graph
+        self.pass_emb    = pass_emb
+        self.tokenizer   = tokenizer
+        self.bm25        = bm25
+        self.dense       = dense
+        self.beam_width  = beam_width
+        self.max_hops    = max_hops
+        self.n_seeds     = n_seeds
         self.stop_thresh = stop_thresh
-        self.id_to_idx  = {c["chunk_id"]: i for i, c in enumerate(corpus)}
+        self.id_to_idx   = {c["chunk_id"]: i for i, c in enumerate(corpus)}
 
     @torch.no_grad()
     def _encode_query(self, question: str) -> np.ndarray:
@@ -218,7 +229,7 @@ class GraphDirectCosine:
             enc["input_ids"].to(DEVICE),
             enc["attention_mask"].to(DEVICE),
         )
-        return v.cpu().numpy()[0]   # [128]
+        return v.cpu().numpy()[0]
 
     def retrieve(self, question: str, top_k: int = 10) -> List[str]:
         dense_r = self.dense.retrieve(question, top_k=self.n_seeds * 3)
@@ -258,8 +269,8 @@ class GraphDirectCosine:
 
 class FullFETraversal:
     """
-    Same structure as FullGraphTraversal in retrieval/run_full_system.py
-    but uses FakeEncoder complements as edge vectors and encode_query for q_vec.
+    FakeEncoder complement edge vectors for hop-directed retrieval.
+    Score(A->B | Q) = dot(encode_query(Q), complement(A, B))
     """
 
     def __init__(
@@ -292,9 +303,8 @@ class FullFETraversal:
         self.n_seeds     = n_seeds
         self.stop_thresh = stop_thresh
         self.faiss_top_k = faiss_top_k
-
-        self.corpus_ids = [c["chunk_id"] for c in corpus]
-        self.id_to_idx  = {c["chunk_id"]: i for i, c in enumerate(corpus)}
+        self.corpus_ids  = [c["chunk_id"] for c in corpus]
+        self.id_to_idx   = {c["chunk_id"]: i for i, c in enumerate(corpus)}
 
     @torch.no_grad()
     def _encode_query(self, question: str) -> np.ndarray:
@@ -316,7 +326,6 @@ class FullFETraversal:
         q_np          = self._encode_query(question)
         retrieved     = list(seeds)
         retrieved_set = set(seeds)
-        # beam: (prev_id or None, curr_id)
         beam: List[Tuple[Optional[str], str]] = [(None, s) for s in seeds]
 
         for _ in range(self.max_hops):
@@ -324,7 +333,7 @@ class FullFETraversal:
 
             for (prev_id, curr_id) in beam:
                 if prev_id is None:
-                    # Hop 1: walk graph edges, score with edge complement
+                    # Hop 1: graph edges scored by complement
                     for (nbr, _, _) in self.graph.get(curr_id, []):
                         if nbr in retrieved_set:
                             continue
@@ -335,7 +344,7 @@ class FullFETraversal:
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
                 else:
-                    # Hop 2+: graph neighbors + FAISS with q_np
+                    # Hop 2+: graph neighbors + FAISS fallback
                     for (nbr, _, _) in self.graph.get(curr_id, []):
                         if nbr in retrieved_set or nbr == curr_id:
                             continue
@@ -346,7 +355,6 @@ class FullFETraversal:
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
 
-                    # FAISS fallback with q_np
                     _, idxs = self.faiss_index.search(
                         q_np.reshape(1, -1).astype(np.float32),
                         self.faiss_top_k * 3,
@@ -357,10 +365,9 @@ class FullFETraversal:
                         nbr = self.corpus_ids[i]
                         if nbr in retrieved_set or nbr == curr_id:
                             continue
-                        ev = self.edge_vecs.get((curr_id, nbr))
-                        score = float(np.dot(q_np, ev)) if ev is not None else float(
-                            np.dot(q_np, self.pass_emb[i])
-                        )
+                        ev    = self.edge_vecs.get((curr_id, nbr))
+                        score = (float(np.dot(q_np, ev)) if ev is not None
+                                 else float(np.dot(q_np, self.pass_emb[i])))
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
 
@@ -369,7 +376,9 @@ class FullFETraversal:
             if max(s for s, _ in candidates.values()) < self.stop_thresh:
                 break
 
-            top_nbrs = sorted(candidates, key=lambda k: candidates[k][0], reverse=True)[:self.beam_width]
+            top_nbrs = sorted(
+                candidates, key=lambda k: candidates[k][0], reverse=True
+            )[:self.beam_width]
             beam = [(candidates[nbr][1], nbr) for nbr in top_nbrs]
             retrieved_set.update(top_nbrs)
             retrieved.extend(top_nbrs)
@@ -397,21 +406,20 @@ def run_retriever(name: str, ret, queries: List[Dict], top_k: int = 10) -> Dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max_examples", type=int, default=None,
-                        help="Cap MuSiQue dev examples (None = all 2417)")
-    parser.add_argument("--top_k",        type=int, default=10)
-    args = parser.parse_args()
-
+def main(max_examples: Optional[int] = None, top_k: int = 10):
+    """
+    Entry point — callable both from CLI and directly from a Jupyter cell.
+      CLI   : python run_eval.py --max_examples 300
+      Jupyter: from run_eval import main; main(max_examples=300)
+    """
     # ── Data ─────────────────────────────────────────────────────────────────
     corpus, queries = load_musique(
-        split="validation", max_examples=args.max_examples, cache=True,
+        split="validation", max_examples=max_examples, cache=True,
     )
-    tag = f"fe_val_{args.max_examples}"
+    tag = f"fe_val_{max_examples}"
     print(f"[eval] {len(corpus):,} chunks | {len(queries):,} queries | {DEVICE}")
 
-    # ── Seed retrievers (generic, unchanged from original pipeline) ───────────
+    # ── Seed retrievers ───────────────────────────────────────────────────────
     bm25 = BM25Retriever()
     bm25.build(corpus, cache_name=f"bm25_{tag}")
 
@@ -422,7 +430,7 @@ def main():
     ckpt_path = MODEL_DIR / "fakencoder_best.pt"
     if not ckpt_path.exists():
         print(f"[eval] Checkpoint not found: {ckpt_path}")
-        print("[eval] Running MDR-only evaluation (no FakeEncoder)")
+        print("[eval] Running MDR-only (no FakeEncoder checkpoint)")
         has_model = False
     else:
         has_model = True
@@ -432,7 +440,7 @@ def main():
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         print(f"[eval] FakeEncoderModel loaded from {ckpt_path}")
 
-    # ── Offline: passage embeddings + graph + edge vectors ───────────────────
+    # ── Offline embeddings + graph + edge vectors ─────────────────────────────
     if has_model:
         pass_emb = compute_passage_embeddings(
             model, corpus, tokenizer, DEVICE,
@@ -452,22 +460,24 @@ def main():
         n, dim  = dense.index.ntotal, dense.index.d
         emb_tmp = np.zeros((n, dim), dtype=np.float32)
         dense.index.reconstruct_n(0, n, emb_tmp)
-        graph   = build_graph(corpus, embeddings=emb_tmp, cache_name=tag)
+        graph = build_graph(corpus, embeddings=emb_tmp, cache_name=tag)
 
     # ── Evaluate ─────────────────────────────────────────────────────────────
     all_systems: Dict[str, Dict] = {}
 
-    mdr               = MDRBaseline(max_hops=3, seeds_per_hop=5)
-    mdr.dense         = dense
-    mdr.id_to_chunk   = {c["chunk_id"]: c for c in corpus}
-    all_systems["MDR (dense, iterative)"] = run_retriever("MDR", mdr, queries, args.top_k)
+    mdr             = MDRBaseline(max_hops=3, seeds_per_hop=5)
+    mdr.dense       = dense
+    mdr.id_to_chunk = {c["chunk_id"]: c for c in corpus}
+    all_systems["MDR (dense, iterative)"] = run_retriever(
+        "MDR", mdr, queries, top_k,
+    )
 
     if has_model:
         g_cos = GraphDirectCosine(
             model, graph, corpus, pass_emb, tokenizer, bm25, dense,
         )
         all_systems["Graph + direct cosine (FE)"] = run_retriever(
-            "Graph+FEcos", g_cos, queries, args.top_k,
+            "Graph+FEcos", g_cos, queries, top_k,
         )
 
         full = FullFETraversal(
@@ -475,7 +485,7 @@ def main():
             faiss_index, tokenizer, bm25, dense,
         )
         all_systems["FULL: FE graph + complement + FAISS"] = run_retriever(
-            "Full", full, queries, args.top_k,
+            "Full", full, queries, top_k,
         )
 
     # ── Summary ──────────────────────────────────────────────────────────────
@@ -493,17 +503,26 @@ def main():
         print(f"  FULL vs cos  gap  : {full_r10 - cos_r10:+.4f}")
 
         if full_r10 > cos_r10 + 0.01:
-            print("  COMPLEMENT HELPS — FakeEncoder is NOT collapsed")
+            print("  COMPLEMENT HELPS -- FakeEncoder is NOT collapsed")
         elif full_r10 >= cos_r10:
-            print("  COMPLEMENT MARGINAL — FakeEncoder adds little over direct cosine")
+            print("  COMPLEMENT MARGINAL -- FakeEncoder adds little over direct cosine")
         else:
-            print("  COMPLEMENT HURTS — FakeEncoder may be collapsed (complement ≈ encode_B)")
+            print("  COMPLEMENT HURTS -- FakeEncoder may be collapsed (complement ≈ encode_B)")
 
-    out_path = RESULTS_DIR / f"eval_fe_{args.max_examples}.json"
+    out_path = RESULTS_DIR / f"eval_fe_{max_examples}.json"
     with open(out_path, "w") as fh:
-        json.dump({"max_examples": args.max_examples, "systems": all_systems}, fh, indent=2)
-    print(f"\n[eval] Results saved → {out_path}")
+        json.dump({"max_examples": max_examples, "systems": all_systems}, fh, indent=2)
+    print(f"\n[eval] Results saved -> {out_path}")
 
+    return all_systems
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_examples", type=int, default=None)
+    parser.add_argument("--top_k",        type=int, default=10)
+    # parse_known_args: ignore Jupyter/IPython argv injected into sys.argv
+    args, _ = parser.parse_known_args()
+    main(max_examples=args.max_examples, top_k=args.top_k)
