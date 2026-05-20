@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-import faiss
+try:
+    import faiss
+except ImportError:
+    import subprocess
+    subprocess.run(["pip", "install", "-q", "faiss-cpu"], check=True)
+    import faiss
+
 import numpy as np
 import torch
 import torch.nn.functional as F
