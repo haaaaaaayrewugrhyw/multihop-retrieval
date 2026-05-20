@@ -1,0 +1,9 @@
+data/
+cache/
+models/
+results/
+__pycache__/
+*.pkl
+*.npy
+*.pt
+*.pyc
