@@ -63,6 +63,10 @@ from baselines  import DenseRetriever, BM25Retriever, reciprocal_rank_fusion  # 
 from graph_builder import build_graph                                          # retrieval/
 from mdr_baseline  import MDRBaseline                                         # retrieval/
 from fakencoder_train import FakeEncoderModel, MAX_A_LEN, MAX_B_LEN           # retrieval_v2/
+try:
+    from model2_train import QueryEncoder                                       # retrieval_v2/
+except ImportError:
+    QueryEncoder = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
@@ -289,8 +293,10 @@ class FullFETraversal:
         n_seeds:      int   = N_SEEDS,
         stop_thresh:  float = STOP_THRESH,
         faiss_top_k:  int   = FAISS_TOP_K,
+        query_model         = None,   # QueryEncoder for complement scoring; None = use model
     ):
         self.model       = model
+        self.query_model = query_model
         self.graph       = graph
         self.edge_vecs   = edge_vecs
         self.pass_emb    = pass_emb
@@ -307,23 +313,28 @@ class FullFETraversal:
         self.id_to_idx   = {c["chunk_id"]: i for i, c in enumerate(corpus)}
 
     @torch.no_grad()
-    def _encode_query(self, question: str) -> np.ndarray:
-        enc = self.tokenizer(
+    def _encode_query(self, question: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (q_comp, q_pass).
+        q_comp: from query_model if available (aligned with complement vectors).
+        q_pass: from model (same space as pass_emb — used for FAISS/passage fallback).
+        """
+        enc  = self.tokenizer(
             question, max_length=MAX_A_LEN, truncation=True,
             padding="max_length", return_tensors="pt",
         )
-        v = self.model.encode_query(
-            enc["input_ids"].to(DEVICE),
-            enc["attention_mask"].to(DEVICE),
-        )
-        return v.cpu().numpy()[0]
+        ids  = enc["input_ids"].to(DEVICE)
+        mask = enc["attention_mask"].to(DEVICE)
+        q_pass = self.model.encode_query(ids, mask).cpu().numpy()[0]
+        q_comp = (self.query_model.encode_query(ids, mask).cpu().numpy()[0]
+                  if self.query_model is not None else q_pass)
+        return q_comp, q_pass
 
     def retrieve(self, question: str, top_k: int = 10) -> List[str]:
         dense_r = self.dense.retrieve(question, top_k=self.n_seeds * 3)
         bm25_r  = self.bm25.retrieve(question,  top_k=self.n_seeds * 3)
         seeds   = reciprocal_rank_fusion([dense_r, bm25_r])[:self.n_seeds]
 
-        q_np          = self._encode_query(question)
+        q_comp, q_pass = self._encode_query(question)
         retrieved     = list(seeds)
         retrieved_set = set(seeds)
         beam: List[Tuple[Optional[str], str]] = [(None, s) for s in seeds]
@@ -340,7 +351,7 @@ class FullFETraversal:
                         ev = self.edge_vecs.get((curr_id, nbr))
                         if ev is None:
                             continue
-                        score = float(np.dot(q_np, ev))
+                        score = float(np.dot(q_comp, ev))
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
                 else:
@@ -351,12 +362,12 @@ class FullFETraversal:
                         ev = self.edge_vecs.get((curr_id, nbr))
                         if ev is None:
                             continue
-                        score = float(np.dot(q_np, ev))
+                        score = float(np.dot(q_comp, ev))
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
 
                     _, idxs = self.faiss_index.search(
-                        q_np.reshape(1, -1).astype(np.float32),
+                        q_pass.reshape(1, -1).astype(np.float32),
                         self.faiss_top_k * 3,
                     )
                     for i in idxs[0]:
@@ -366,8 +377,8 @@ class FullFETraversal:
                         if nbr in retrieved_set or nbr == curr_id:
                             continue
                         ev    = self.edge_vecs.get((curr_id, nbr))
-                        score = (float(np.dot(q_np, ev)) if ev is not None
-                                 else float(np.dot(q_np, self.pass_emb[i])))
+                        score = (float(np.dot(q_comp, ev)) if ev is not None
+                                 else float(np.dot(q_pass, self.pass_emb[i])))
                         if nbr not in candidates or score > candidates[nbr][0]:
                             candidates[nbr] = (score, curr_id)
 
@@ -406,7 +417,7 @@ def run_retriever(name: str, ret, queries: List[Dict], top_k: int = 10) -> Dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(max_examples: Optional[int] = None, top_k: int = 10):
+def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool = False):
     """
     Entry point — callable both from CLI and directly from a Jupyter cell.
       CLI   : python run_eval.py --max_examples 300
@@ -440,6 +451,18 @@ def main(max_examples: Optional[int] = None, top_k: int = 10):
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         print(f"[eval] FakeEncoderModel loaded from {ckpt_path}")
 
+    # ── Optionally load Model 2 (QueryEncoder) ────────────────────────────────
+    model2 = None
+    if has_model and QueryEncoder is not None:
+        m2_ckpt = MODEL_DIR / "model2_best.pt"
+        if m2_ckpt.exists():
+            model2 = QueryEncoder().to(DEVICE)
+            model2.load_state_dict(torch.load(m2_ckpt, map_location=DEVICE))
+            model2.eval()
+            print(f"[eval] QueryEncoder (Model 2) loaded from {m2_ckpt}")
+        else:
+            print("[eval] model2_best.pt not found — using Model 1 for query encoding")
+
     # ── Offline embeddings + graph + edge vectors ─────────────────────────────
     if has_model:
         pass_emb = compute_passage_embeddings(
@@ -447,6 +470,21 @@ def main(max_examples: Optional[int] = None, top_k: int = 10):
             cache_path=CACHE_DIR / f"fe_pass_emb_{tag}.npy",
         )
         graph = build_graph(corpus, embeddings=pass_emb, cache_name=f"{tag}_fe")
+
+        # Optionally add gold chain edges from eval queries (oracle upper-bound test)
+        if gold_edges:
+            gold_added = 0
+            for q in queries:
+                chain = q.get("chain_chunk_ids", [])
+                for i in range(len(chain) - 1):
+                    a_id, b_id = chain[i], chain[i + 1]
+                    existing = {nbr for (nbr, _, _) in graph.get(a_id, [])}
+                    if b_id not in existing:
+                        if a_id not in graph:
+                            graph[a_id] = []
+                        graph[a_id].append((b_id, 1.0, "gold_chain"))
+                        gold_added += 1
+            print(f"[eval] Gold chain edges added: {gold_added:,}")
 
         faiss_index = faiss.IndexFlatIP(pass_emb.shape[1])
         faiss_index.add(pass_emb)
@@ -483,6 +521,7 @@ def main(max_examples: Optional[int] = None, top_k: int = 10):
         full = FullFETraversal(
             model, graph, corpus, edge_vecs, pass_emb,
             faiss_index, tokenizer, bm25, dense,
+            query_model=model2,
         )
         all_systems["FULL: FE graph + complement + FAISS"] = run_retriever(
             "Full", full, queries, top_k,
@@ -523,6 +562,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--top_k",        type=int, default=10)
+    parser.add_argument("--gold_edges",   action="store_true",
+                        help="Add gold chain edges to graph (oracle upper-bound test)")
     # parse_known_args: ignore Jupyter/IPython argv injected into sys.argv
     args, _ = parser.parse_known_args()
-    main(max_examples=args.max_examples, top_k=args.top_k)
+    main(max_examples=args.max_examples, top_k=args.top_k, gold_edges=args.gold_edges)
