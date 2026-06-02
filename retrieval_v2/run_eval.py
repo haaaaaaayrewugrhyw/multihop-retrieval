@@ -447,11 +447,17 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
         has_model = True
         model     = FakeEncoderModel().to(DEVICE)
         state = torch.load(ckpt_path, map_location=DEVICE)
-        incompatible = model.load_state_dict(state, strict=False)
-        if incompatible.unexpected_keys:
-            print(f"[eval] Ignored checkpoint keys not in current model: {incompatible.unexpected_keys}")
-        if incompatible.missing_keys:
-            print(f"[eval] WARNING -- keys missing from checkpoint: {incompatible.missing_keys}")
+        # Filter checkpoint keys to exactly match current model — handles version skew
+        # (e.g. old checkpoints that have query_proj, pos_emb_b, etc.)
+        model_keys = set(model.state_dict().keys())
+        ignored    = [k for k in state if k not in model_keys]
+        missing    = [k for k in model_keys if k not in state]
+        state      = {k: v for k, v in state.items() if k in model_keys}
+        if ignored:
+            print(f"[eval] Ignored {len(ignored)} checkpoint keys not in current model: {ignored}")
+        if missing:
+            print(f"[eval] WARNING -- {len(missing)} model keys not in checkpoint: {missing}")
+        model.load_state_dict(state, strict=False)
         model.eval()
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         print(f"[eval] FakeEncoderModel loaded from {ckpt_path}")
