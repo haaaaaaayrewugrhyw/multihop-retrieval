@@ -1,0 +1,6 @@
+models/
+cache/
+results/
+*.pt
+*.npy
+*.pkl
