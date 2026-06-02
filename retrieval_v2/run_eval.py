@@ -446,7 +446,12 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
     else:
         has_model = True
         model     = FakeEncoderModel().to(DEVICE)
-        model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+        state = torch.load(ckpt_path, map_location=DEVICE)
+        incompatible = model.load_state_dict(state, strict=False)
+        if incompatible.unexpected_keys:
+            print(f"[eval] Ignored checkpoint keys not in current model: {incompatible.unexpected_keys}")
+        if incompatible.missing_keys:
+            print(f"[eval] WARNING -- keys missing from checkpoint: {incompatible.missing_keys}")
         model.eval()
         tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         print(f"[eval] FakeEncoderModel loaded from {ckpt_path}")
