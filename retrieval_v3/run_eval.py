@@ -76,6 +76,8 @@ except ImportError:
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 GEN_CKPT     = "generator_best.pt"   # override before main() to eval an ablation,
                                      # e.g. run_eval.GEN_CKPT = "generator_best_nodrop.pt"
+GEN_USE_GATE = True                  # set False to eval a --no_gate ablation checkpoint
+                                     # (use_gate is not stored in the state_dict)
 BEAM_WIDTH   = 3
 MAX_HOPS     = 3
 N_SEEDS      = 5     # MUST be < top_k(10): seeds fill the head of the list, hops fill
@@ -457,7 +459,7 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
         has_model = False
     else:
         has_model = True
-        model     = FakeEncoderModel().to(DEVICE)
+        model     = FakeEncoderModel(use_gate=GEN_USE_GATE).to(DEVICE)
         state = torch.load(ckpt_path, map_location=DEVICE)
         # Filter checkpoint keys to exactly match current model — handles version skew
         # (e.g. old checkpoints that have query_proj, pos_emb_b, etc.)
