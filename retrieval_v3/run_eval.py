@@ -76,7 +76,9 @@ except ImportError:
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 BEAM_WIDTH   = 3
 MAX_HOPS     = 3
-N_SEEDS      = 15
+N_SEEDS      = 5     # MUST be < top_k(10): seeds fill the head of the list, hops fill
+                     # the rest. With N_SEEDS>=top_k the complement-scored hops never
+                     # reach the top-10 (this masked v1/v2/v3 complement signal entirely).
 STOP_THRESH  = 0.05
 FAISS_TOP_K  = 20
 ENC_BATCH    = 64    # passages per batch for encode_query
