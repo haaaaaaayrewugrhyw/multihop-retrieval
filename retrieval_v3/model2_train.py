@@ -47,11 +47,12 @@ from generator_train import (
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_Q_LEN     = 64
 BATCH_SIZE    = 8
-LR            = 2e-5
-N_EPOCHS      = 3
+LR            = 1e-5     # was 2e-5 — lower LR fights the train 0.99 / val 0.45 overfit
+N_EPOCHS      = 2        # was 3 — val_acc plateaued after epoch 1; best saved anyway
 MARGIN        = 0.2
 WARMUP_FRAC   = 0.06
 MAX_GRAD_NORM = 1.0
+WEIGHT_DECAY  = 0.05     # was 1e-2 — stronger regularization
 LOG_EVERY     = 300
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
@@ -360,7 +361,7 @@ def main():
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     scaler       = GradScaler("cuda", enabled=AMP_ENABLED)
-    optimizer    = torch.optim.AdamW(model2.parameters(), lr=args.lr, weight_decay=1e-2)
+    optimizer    = torch.optim.AdamW(model2.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     total_steps  = len(train_loader) * args.epochs
     warmup_steps = int(total_steps * WARMUP_FRAC)
     scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)

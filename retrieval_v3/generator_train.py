@@ -88,8 +88,14 @@ class ComplementGenerator(nn.Module):
     extract_complement() signatures, so run_eval.py works unchanged.
     """
 
-    def __init__(self, n_dec_layers: int = 2, d_proj: int = D_PROJ):
+    def __init__(self, n_dec_layers: int = 2, d_proj: int = D_PROJ,
+                 use_gate: bool = True, context_drop: float = CONTEXT_DROP):
         super().__init__()
+        # Ablation switches (saved so eval-time loading reproduces them):
+        #   use_gate=False     -> uniform pooling instead of complement gate g_i
+        #   context_drop=0.0   -> no context dropout (expected to collapse)
+        self.use_gate     = use_gate
+        self.context_drop = context_drop
 
         # Shared BERT: encodes both A and B
         self.encoder1 = BertModel.from_pretrained("bert-base-uncased")
@@ -182,6 +188,10 @@ class ComplementGenerator(nn.Module):
         attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
         g_i = 1.0 - attn_probs.max(dim=-1).values        # [B, T_B]
 
+        # ABLATION: use_gate=False -> uniform weights (plain mean pool of comp_tokens)
+        if not self.use_gate:
+            g_i = torch.ones_like(g_i)
+
         # Complement-weighted pooling: only real B tokens, weighted by g_i
         b_real    = attn_mask_b.float()                   # [B, T_B]
         g_masked  = g_i * b_real
@@ -234,9 +244,10 @@ class ComplementGenerator(nn.Module):
             input_ids_a, attn_mask_a, input_ids_b, attn_mask_b
         )
 
-        # Context dropout: randomly hide 40% of A positions from D
-        if self.training:
-            keep = torch.rand_like(attn_mask_a.float()) > CONTEXT_DROP
+        # Context dropout: randomly hide context_drop% of A positions from D
+        # (ABLATION: context_drop=0.0 -> D sees full A -> expected to collapse)
+        if self.training and self.context_drop > 0.0:
+            keep = torch.rand_like(attn_mask_a.float()) > self.context_drop
             attn_mask_a_dec = attn_mask_a * keep.long()
         else:
             attn_mask_a_dec = attn_mask_a
@@ -439,6 +450,13 @@ def main():
     parser.add_argument("--batch_size",    type=int,   default=BATCH_SIZE)
     parser.add_argument("--epochs",        type=int,   default=N_EPOCHS)
     parser.add_argument("--lr",            type=float, default=LR)
+    # Ablation flags (for the contribution's ablation study):
+    parser.add_argument("--context_drop",  type=float, default=CONTEXT_DROP,
+                        help="A-token dropout in D. 0.0 = ablation (expect collapse).")
+    parser.add_argument("--no_gate",       action="store_true",
+                        help="Disable complement gate g_i (uniform pooling ablation).")
+    parser.add_argument("--tag",           type=str,   default="",
+                        help="Suffix for checkpoint names, e.g. _nodrop / _nogate.")
     args = parser.parse_args()
 
     if args.smoke:
@@ -446,6 +464,8 @@ def main():
         args.batch_size   = 2
         args.epochs       = 1
         print("[smoke] 50 examples, 1 epoch, CPU-friendly")
+
+    print(f"Ablation: context_drop={args.context_drop}  use_gate={not args.no_gate}  tag='{args.tag}'")
 
     print(f"Device : {DEVICE}")
     if DEVICE == "cuda":
@@ -484,7 +504,9 @@ def main():
 
     # ---- Model --------------------------------------------------------------
     print("\n[2] Building ComplementGenerator ...")
-    model = ComplementGenerator().to(DEVICE)
+    model = ComplementGenerator(
+        use_gate=not args.no_gate, context_drop=args.context_drop,
+    ).to(DEVICE)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"   Parameters: {total_params:.1f}M")
 
@@ -514,12 +536,12 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), MODEL_DIR / "generator_best.pt")
+            torch.save(model.state_dict(), MODEL_DIR / f"generator_best{args.tag}.pt")
             print(f"   -> Saved best (val_loss={val_loss:.4f}, collapse_sim={val_collapse:.4f})")
 
-    torch.save(model.state_dict(), MODEL_DIR / "generator_final.pt")
+    torch.save(model.state_dict(), MODEL_DIR / f"generator_final{args.tag}.pt")
     print(f"\n[4] Done. Best val_loss={best_val_loss:.4f}")
-    print(f"   Checkpoints: {MODEL_DIR}/generator_best.pt  |  generator_final.pt")
+    print(f"   Checkpoints: {MODEL_DIR}/generator_best{args.tag}.pt  |  generator_final{args.tag}.pt")
 
     if args.smoke:
         print("\n[smoke] PASSED")
