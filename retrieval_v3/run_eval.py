@@ -74,6 +74,8 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
+GEN_CKPT     = "generator_best.pt"   # override before main() to eval an ablation,
+                                     # e.g. run_eval.GEN_CKPT = "generator_best_nodrop.pt"
 BEAM_WIDTH   = 3
 MAX_HOPS     = 3
 N_SEEDS      = 5     # MUST be < top_k(10): seeds fill the head of the list, hops fill
@@ -434,7 +436,11 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
         split="validation", max_examples=max_examples, cache=True,
     )
     tag = f"fe_val_{max_examples}"
-    print(f"[eval] {len(corpus):,} chunks | {len(queries):,} queries | {DEVICE}")
+    # model-specific tag: pass_emb / edge_vecs depend on the generator checkpoint,
+    # so different checkpoints (e.g. ablations) must NOT share those caches.
+    ckpt_stem = Path(GEN_CKPT).stem
+    mtag = tag if ckpt_stem == "generator_best" else f"{tag}_{ckpt_stem}"
+    print(f"[eval] {len(corpus):,} chunks | {len(queries):,} queries | {DEVICE} | ckpt={GEN_CKPT}")
 
     # ── Seed retrievers ───────────────────────────────────────────────────────
     bm25 = BM25Retriever()
@@ -444,7 +450,7 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
     dense.build(corpus, cache_name=f"dense_{tag}")
 
     # ── Load ComplementGenerator checkpoint ───────────────────────────────────
-    ckpt_path = MODEL_DIR / "generator_best.pt"
+    ckpt_path = MODEL_DIR / GEN_CKPT
     if not ckpt_path.exists():
         print(f"[eval] Checkpoint not found: {ckpt_path}")
         print("[eval] Running MDR-only (no generator checkpoint)")
@@ -484,9 +490,9 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
     if has_model:
         pass_emb = compute_passage_embeddings(
             model, corpus, tokenizer, DEVICE,
-            cache_path=CACHE_DIR / f"fe_pass_emb_{tag}.npy",
+            cache_path=CACHE_DIR / f"fe_pass_emb_{mtag}.npy",
         )
-        graph = build_graph(corpus, embeddings=pass_emb, cache_name=f"{tag}_fe")
+        graph = build_graph(corpus, embeddings=pass_emb, cache_name=f"{mtag}_fe")
 
         # Optionally add gold chain edges from eval queries (oracle upper-bound test)
         if gold_edges:
@@ -509,7 +515,7 @@ def main(max_examples: Optional[int] = None, top_k: int = 10, gold_edges: bool =
 
         edge_vecs = compute_edge_vectors(
             model, corpus, graph, tokenizer, DEVICE,
-            cache_path=CACHE_DIR / f"fe_edge_vecs_{tag}.pkl",
+            cache_path=CACHE_DIR / f"fe_edge_vecs_{mtag}.pkl",
         )
     else:
         n, dim  = dense.index.ntotal, dense.index.d
