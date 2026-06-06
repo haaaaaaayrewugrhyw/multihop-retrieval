@@ -1,27 +1,30 @@
 """
-data_wikiedits.py -- WikiAtomicEdits loader for complement validation
+data_wikiedits.py -- clean-insertion loader for complement validation
 =====================================================================
 
-WikiAtomicEdits (Faruqui et al. 2018): each row is a sentence pair where the
-edited sentence B = base sentence A + one contiguous inserted phrase.
-  base_sentence (A)  |  inserted_phrase (gold complement)  |  edited_sentence (B)
+Source: IteraTeR (wanyu/IteraTeR_full_sent on HuggingFace; Apache-2.0, parquet,
+no trust_remote_code). 158K+ sentence revision pairs (before_sent -> after_sent)
+across Wikipedia / arXiv / news, with edit-intention labels.
 
-This is the IDEAL testbed for the complement idea: A and B overlap maximally,
-and the inserted phrase is an explicit, literal ground-truth "what B adds."
+(The original WikiAtomicEdits GCS bucket is 403-gated, so we derive the SAME
+"B = A + one contiguous inserted span" property from IteraTeR via a token diff.)
 
-We filter out trivial short insertions (30% are 1 word) and keep substantive
-multi-word insertions so the residual is large enough to matter.
+For each revision pair we keep ONLY clean insertions: after_sent equals before_sent
+with exactly one contiguous span inserted. That inserted span is the explicit,
+literal ground-truth "what B adds" -- the complement target. We require the span
+to have >= MIN_INSERT_TOKENS tokens and >= 2 content words so the residual matters.
+
+  base (A)  |  inserted_phrase (gold complement)  |  edited (B)
 
 The Dataset/collator emit the SAME keys as generator_train.HopPairDataset so the
 existing train_epoch/validate loop is reused unchanged.
 """
 
-import gzip
 import pickle
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -34,12 +37,9 @@ sys.path.insert(0, str(_HERE.parent / "retrieval_v2"))
 from generator_train import MAX_A_LEN, MAX_B_LEN  # noqa: E402
 
 # ── Config ──────────────────────────────────────────────────────────────────
-WIKI_URL = "https://storage.googleapis.com/wiki-atomic-edits/english/insertions.tsv.gz"
-DATA_DIR  = _HERE / "data"
-CACHE_DIR = _HERE / "cache"
-DATA_DIR.mkdir(exist_ok=True)
+HF_DATASET = "wanyu/IteraTeR_full_sent"
+CACHE_DIR  = _HERE / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
-GZ_PATH = DATA_DIR / "insertions.tsv.gz"
 
 MIN_INSERT_TOKENS = 5    # keep only substantive multi-word insertions
 
@@ -51,45 +51,39 @@ _STOP = {
 }
 
 
-# ── Download ────────────────────────────────────────────────────────────────
+# ── Clean-insertion diff ──────────────────────────────────────────────────────
 
-def download(dest: Path = GZ_PATH) -> Path:
-    """Download the WikiAtomicEdits English insertions TSV.gz if missing.
-    Robust: removes any zero-byte leftover (e.g. from a failed wget), downloads
-    via urllib, and verifies a non-trivial size."""
-    if dest.exists() and dest.stat().st_size > 1_000_000:
-        print(f"[data] already present: {dest} ({dest.stat().st_size/1e6:.0f} MB)")
-        return dest
-    if dest.exists():
-        dest.unlink()   # drop empty/partial file so we actually re-download
-    print(f"[data] downloading {WIKI_URL} ...")
-    import urllib.request
-    req = urllib.request.Request(WIKI_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-    size = dest.stat().st_size
-    if size < 1_000_000:
-        raise RuntimeError(
-            f"download failed: {dest} is only {size} bytes. "
-            f"Check connectivity / URL {WIKI_URL}"
-        )
-    print(f"[data] saved {dest} ({size/1e6:.0f} MB)")
-    return dest
+import re
+_TOK = re.compile(r"\w+|[^\w\s]")   # words OR single punctuation chars (so 'home.' -> 'home','.')
 
 
-# ── Filtering ───────────────────────────────────────────────────────────────
-
-def _ok_insertion(phrase: str, min_tokens: int) -> bool:
-    toks = phrase.split()
-    if len(toks) < min_tokens:
-        return False
-    # require at least 2 content (non-stopword, alphabetic) tokens
-    content = [t for t in toks if t.lower() not in _STOP and any(c.isalpha() for c in t)]
-    return len(content) >= 2
+def clean_insertion(before: str, after: str, min_tokens: int) -> Optional[str]:
+    """
+    Return the inserted span IFF `after` == `before` with exactly ONE contiguous
+    span inserted (before = prefix + suffix, after = prefix + INSERT + suffix).
+    Punctuation is tokenized separately so end-of-sentence inserts (where the
+    period 'moves') are still detected. Requires >= min_tokens WORD tokens in the
+    insert and >= 2 content words.
+    """
+    bt, at = _TOK.findall(before), _TOK.findall(after)
+    if len(at) <= len(bt):
+        return None
+    p = 0
+    while p < len(bt) and p < len(at) and bt[p] == at[p]:
+        p += 1
+    s = 0
+    while s < (len(bt) - p) and s < (len(at) - p) and bt[len(bt)-1-s] == at[len(at)-1-s]:
+        s += 1
+    if p + s != len(bt):          # before is NOT just after-minus-one-span -> reject
+        return None
+    insert = at[p: len(at) - s]
+    words = [t for t in insert if any(c.isalpha() or c.isdigit() for c in t)]
+    if len(words) < min_tokens:
+        return None
+    content = [t for t in words if t.lower() not in _STOP]
+    if len(content) < 2:
+        return None
+    return " ".join(insert)
 
 
 def load_triples(
@@ -99,38 +93,45 @@ def load_triples(
     seed: int = 42,
 ) -> List[Dict]:
     """
-    Return filtered [{"base":A, "inserted":phrase, "edited":B}, ...].
-    Streams the gz, applies the multi-word filter, shuffles, subsamples.
+    Load IteraTeR, keep only clean contiguous insertions, return
+    [{"base":A, "inserted":span, "edited":B}, ...]; shuffle + subsample + cache.
     """
     tag = f"{max_examples}_{min_insert_tokens}"
-    cache_file = CACHE_DIR / f"wikiedits_{tag}.pkl"
+    cache_file = CACHE_DIR / f"iterater_ins_{tag}.pkl"
     if cache and cache_file.exists():
         print(f"[data] loading cached triples: {cache_file}")
         with open(cache_file, "rb") as f:
             return pickle.load(f)
 
-    download()
-    # Read more than we need (filtering drops many), then subsample.
-    over = (max_examples * 12) if max_examples else None
+    from datasets import load_dataset
+    print(f"[data] loading {HF_DATASET} (HuggingFace, parquet) ...")
+    over = (max_examples * 5) if max_examples else None   # early-stop for small runs
     triples: List[Dict] = []
-    with gzip.open(GZ_PATH, "rt", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3:
+    for split in ["train", "validation", "test"]:
+        if over and len(triples) >= over:
+            break
+        try:
+            ds = load_dataset(HF_DATASET, split=split)
+        except Exception as e:
+            print(f"[data] split {split} unavailable: {e}")
+            continue
+        for row in ds:
+            before = (row.get("before_sent") or "").strip()
+            after  = (row.get("after_sent")  or "").strip()
+            if not before or not after:
                 continue
-            base, inserted, edited = parts
-            if not base or not edited or not inserted:
+            ins = clean_insertion(before, after, min_insert_tokens)
+            if ins is None:
                 continue
-            if not _ok_insertion(inserted, min_insert_tokens):
-                continue
-            triples.append({"base": base, "inserted": inserted, "edited": edited})
+            triples.append({"base": before, "inserted": ins, "edited": after})
             if over and len(triples) >= over:
                 break
+        print(f"[data]   {split}: cumulative clean insertions = {len(triples):,}")
 
     random.Random(seed).shuffle(triples)
     if max_examples:
         triples = triples[:max_examples]
-    print(f"[data] filtered triples: {len(triples):,} "
+    print(f"[data] clean-insertion triples: {len(triples):,} "
           f"(min_insert_tokens={min_insert_tokens})")
 
     if cache:
