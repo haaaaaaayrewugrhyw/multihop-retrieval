@@ -54,14 +54,30 @@ _STOP = {
 # ── Download ────────────────────────────────────────────────────────────────
 
 def download(dest: Path = GZ_PATH) -> Path:
-    """Download the WikiAtomicEdits English insertions TSV.gz if missing."""
-    if dest.exists() and dest.stat().st_size > 0:
+    """Download the WikiAtomicEdits English insertions TSV.gz if missing.
+    Robust: removes any zero-byte leftover (e.g. from a failed wget), downloads
+    via urllib, and verifies a non-trivial size."""
+    if dest.exists() and dest.stat().st_size > 1_000_000:
         print(f"[data] already present: {dest} ({dest.stat().st_size/1e6:.0f} MB)")
         return dest
+    if dest.exists():
+        dest.unlink()   # drop empty/partial file so we actually re-download
     print(f"[data] downloading {WIKI_URL} ...")
     import urllib.request
-    urllib.request.urlretrieve(WIKI_URL, dest)
-    print(f"[data] saved {dest} ({dest.stat().st_size/1e6:.0f} MB)")
+    req = urllib.request.Request(WIKI_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+    size = dest.stat().st_size
+    if size < 1_000_000:
+        raise RuntimeError(
+            f"download failed: {dest} is only {size} bytes. "
+            f"Check connectivity / URL {WIKI_URL}"
+        )
+    print(f"[data] saved {dest} ({size/1e6:.0f} MB)")
     return dest
 
 
