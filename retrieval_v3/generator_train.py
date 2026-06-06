@@ -101,10 +101,11 @@ class ComplementGenerator(nn.Module):
         self.encoder1 = BertModel.from_pretrained("bert-base-uncased")
         self.encoder1.gradient_checkpointing_enable()
 
-        # B->A cross-attention (B queries A to find shared content)
-        self.cross_attn = nn.MultiheadAttention(
-            D_MODEL, N_HEADS, dropout=0.1, batch_first=True
-        )
+        # Match-scaled complement (validated in synthetic_complement_test.py):
+        # one cosine-similarity attention (B->A) with a LEARNABLE temperature.
+        # log_tau init -1.8 -> tau = softplus(-1.8)+0.01 ~= 0.16 (sharp, so real
+        # matches concentrate instead of averaging into a diffuse mean(A)).
+        self.log_tau = nn.Parameter(torch.tensor(-1.8))
 
         # Learned lambda gate (Flamingo/ReZero principle)
         # sigmoid(0) + 0.20 = 0.70 at init -- moderate subtraction strength
@@ -165,28 +166,29 @@ class ComplementGenerator(nn.Module):
         A_sa, key_pad_a = self._encode(input_ids_a, attn_mask_a)  # [B, T_A, D]
         B_sa, _         = self._encode(input_ids_b, attn_mask_b)  # [B, T_B, D]
 
-        # B->A cross-attention: for each B token, retrieve the most similar A content
-        B_in_A, _ = self.cross_attn(
-            query=B_sa, key=A_sa, value=A_sa,
-            key_padding_mask=key_pad_a,
-            need_weights=False,
-        )
-        # B_in_A: [B, T_B, 768]
+        # ── Unified match-scaled complement (validated by synthetic_complement_test.py)
+        # Cosine similarity B->A with a learnable temperature. ONE attention drives
+        # both the subtraction and the gate, so the "match" is consistent.
+        A_n = F.normalize(A_sa, dim=-1)
+        B_n = F.normalize(B_sa, dim=-1)
+        tau = F.softplus(self.log_tau) + 1e-2
+        sim = torch.matmul(B_n, A_n.transpose(-2, -1)) / tau      # [B, T_B, T_A] cosine/tau
+        sim = sim.masked_fill(key_pad_a.unsqueeze(1), float("-inf"))
+        attn = torch.softmax(sim, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)
 
-        # Lambda gate subtraction (DiffAttn principle):
-        # comp_tokens = B_sa - lambda * B_in_A
-        # high lambda -> aggressive complement; low lambda -> gentle
+        B_in_A = torch.matmul(attn, A_sa)                # [B, T_B, D]  real A values (same space as B_sa)
+        match  = attn.max(dim=-1).values                 # [B, T_B]  how much B token i is actually in A
+
+        # MATCH-SCALED subtraction (the fix): novel tokens (low match) keep their
+        # content; only tokens that truly appear in A get their A-part removed.
+        # Old leak was `B_sa - lam*B_in_A` which subtracted a diffuse mean(A) even
+        # from novel tokens (softmax sums to 1 regardless of any real match).
         lam = torch.sigmoid(self.lambda_gate) + 0.20     # scalar in [0.20, 1.20]
-        comp_tokens = B_sa - lam * B_in_A                # [B, T_B, 768]
+        comp_tokens = B_sa - lam * match.unsqueeze(-1) * B_in_A   # [B, T_B, D]
 
-        # Complement gate: g_i = how much of B token i is NOT explained by A
-        # Uses raw dot-product similarities (not the learned W_Q/W_K from cross_attn)
-        # This is more principled: measures raw semantic similarity, not learned attention
-        raw_scores = torch.matmul(B_sa, A_sa.transpose(-2, -1)) / (D_MODEL ** 0.5)
-        raw_scores = raw_scores.masked_fill(key_pad_a.unsqueeze(1), float("-inf"))
-        attn_probs = F.softmax(raw_scores, dim=-1)
-        attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
-        g_i = 1.0 - attn_probs.max(dim=-1).values        # [B, T_B]
+        # Complement gate from the SAME match: g_i high => B token not in A
+        g_i = 1.0 - match                                # [B, T_B]
 
         # ABLATION: use_gate=False -> uniform weights (plain mean pool of comp_tokens)
         if not self.use_gate:
