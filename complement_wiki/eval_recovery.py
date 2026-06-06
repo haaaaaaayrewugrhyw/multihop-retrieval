@@ -63,23 +63,26 @@ def _enc(model, tokenizer, texts, max_len, batch=64):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt",       type=str, default="complement_wiki_best.pt")
-    ap.add_argument("--n",          type=int, default=2000, help="eval triples")
-    ap.add_argument("--skip",       type=int, default=124000,
-                    help="skip the first SKIP triples (= train+val used by training) so "
-                         "eval is HELD-OUT. Must match train's max_examples+val_examples.")
+    ap.add_argument("--n",          type=int, default=2000, help="eval triples (<= train val_examples)")
+    ap.add_argument("--pool",       type=int, default=124000,
+                    help="SAME max_examples training used (train MAX_EXAMPLES + val). With the "
+                         "fixed seed this reproduces training's shuffled pool; eval uses the "
+                         "FIRST n triples = training's VAL slice (never gradient-trained).")
+    ap.add_argument("--val_examples", type=int, default=4000,
+                    help="train's val_examples; eval n must be <= this to stay held-out.")
     ap.add_argument("--n_distract", type=int, default=19,   help="distractors per query")
     ap.add_argument("--batch",      type=int, default=32)
     args = ap.parse_args()
 
     print(f"Device: {DEVICE} | ckpt: {args.ckpt}")
-    # Load skip+n triples (same fixed-seed shuffle as training), then take the
-    # held-out tail [skip : skip+n] so eval never overlaps training data.
-    pool = load_triples(max_examples=args.skip + args.n, cache=True)
-    triples = pool[args.skip:args.skip + args.n]
-    if len(triples) < args.n:
-        print(f"WARNING: only {len(triples)} held-out triples after skip={args.skip}; "
-              "reduce --skip or --n, or filter yields fewer rows than expected.")
-    print(f"Eval triples (held-out): {len(triples):,}")
+    if args.n > args.val_examples:
+        print(f"WARNING: n={args.n} > val_examples={args.val_examples}; some eval triples "
+              "were in the TRAINING set. Reduce --n to stay held-out.")
+    # Reproduce training's shuffled pool (same max_examples + seed), then take the
+    # FIRST n = training's validation slice (used only for val_loss, never trained on).
+    pool = load_triples(max_examples=args.pool, cache=True)
+    triples = pool[:args.n]
+    print(f"Eval triples (held-out val slice): {len(triples):,} of pool {len(pool):,}")
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     model = ComplementGenerator().to(DEVICE)
