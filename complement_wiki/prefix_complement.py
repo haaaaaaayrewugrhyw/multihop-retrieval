@@ -105,13 +105,17 @@ class PrefixComplementLM(nn.Module):
         return E, H_A, A_pad
 
     # ---- Discriminator ------------------------------------------------------
-    def forward(self, A_ids, A_mask, B_ids, B_mask):
-        """Returns (logits [B, TB, V], E [B, TB, 128]). Predicts each b_t leak-free."""
+    def forward(self, A_ids, A_mask, B_ids, B_mask, ablate_edge: bool = False):
+        """Returns (logits [B, TB, V], E [B, TB, 128]). Predicts each b_t leak-free.
+        ablate_edge=True zeros the edge so D must reconstruct B from A ALONE
+        (used to measure recon-gain = how much the edge actually helps)."""
         E, H_A, A_pad = self.generate_edge(A_ids, A_mask, B_ids, B_mask)
 
         # pred_src[t] = edge that saw only B[<t]  (shift E right, prepend bos edge)
         bos = self.edge_bos.expand(E.size(0), 1, D_EDGE)
         pred_src = torch.cat([bos, E[:, :-1, :]], dim=1)        # [B,TB,128]
+        if ablate_edge:
+            pred_src = torch.zeros_like(pred_src)               # D sees only A
 
         x = self.d_up(pred_src)                                  # [B,TB,768]
         for cross, ln1, ln2, ffn in zip(self.d_cross, self.d_ln1, self.d_ln2, self.d_ffn):
