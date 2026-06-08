@@ -74,22 +74,26 @@ def find_span(hay, needle):
 
 @torch.no_grad()
 def evaluate(model, loader, tok, max_steps=200):
-    """ppl (gate + ablated) and the alpha/recon-gain localization on phrase spans."""
+    """ppl (gate + backbone) and TWO localizations on phrase spans:
+       - alpha  : did the LEARNED gate open on novel tokens?
+       - potential: where does the edge HELP (alpha forced to 1 vs backbone)?  This is
+         independent of the gate -> tells us if the novelty signal exists at all."""
     model.eval()
     tot, tot_abl, n = 0.0, 0.0, 0
-    a_nov, a_cop = [], []          # gate alpha
-    d_nov, d_cop = [], []          # per-token recon-gain (nll_abl - nll_edge)
+    a_nov, a_cop = [], []          # learned gate alpha
+    p_nov, p_cop = [], []          # POTENTIAL recon-gain (alpha=1 vs backbone)
     matched = 0
     for i, (Aid, Am, Bid, Bm, P) in enumerate(loader):
         if i >= max_steps: break
         Aid, Am, Bid, Bm = Aid.to(DEVICE), Am.to(DEVICE), Bid.to(DEVICE), Bm.to(DEVICE)
         logits, _, alpha = model(Aid, Am, Bid, Bm)
         logits_abl, _, _ = model(Aid, Am, Bid, Bm, ablate_edge=True)
+        logits_pot, _, _ = model(Aid, Am, Bid, Bm, alpha_override=1.0)   # edge fully ON
         tot += rec_loss(logits, Bid).item(); tot_abl += rec_loss(logits_abl, Bid).item(); n += 1
 
-        nll_e = -F.log_softmax(logits.float(), -1).gather(-1, Bid.unsqueeze(-1)).squeeze(-1)
         nll_a = -F.log_softmax(logits_abl.float(), -1).gather(-1, Bid.unsqueeze(-1)).squeeze(-1)
-        delta = (nll_a - nll_e).cpu().numpy()
+        nll_p = -F.log_softmax(logits_pot.float(), -1).gather(-1, Bid.unsqueeze(-1)).squeeze(-1)
+        pot = (nll_a - nll_p).cpu().numpy()   # how much the edge COULD help each token
         al = alpha.cpu().numpy()
         for bi, phrase in enumerate(P):
             real = int(Bm[bi].sum().item())
@@ -101,38 +105,42 @@ def evaluate(model, loader, tok, max_steps=200):
             matched += 1; lo, hi = span
             for t in range(1, real - 1):
                 (a_nov if lo <= t < hi else a_cop).append(float(al[bi, t]))
-                (d_nov if lo <= t < hi else d_cop).append(float(delta[bi, t]))
+                (p_nov if lo <= t < hi else p_cop).append(float(pot[bi, t]))
     L = tot / max(n, 1); L_abl = tot_abl / max(n, 1)
     return {
         "ppl": math.exp(L), "ppl_abl": math.exp(L_abl),
         "a_nov": float(np.mean(a_nov)) if a_nov else 0.0,
         "a_cop": float(np.mean(a_cop)) if a_cop else 0.0,
-        "d_nov": float(np.mean(d_nov)) if d_nov else 0.0,
-        "d_cop": float(np.mean(d_cop)) if d_cop else 0.0,
+        "p_nov": float(np.mean(p_nov)) if p_nov else 0.0,
+        "p_cop": float(np.mean(p_cop)) if p_cop else 0.0,
         "matched": matched,
     }
 
 
 def report(tag, m):
+    a_ratio = m['a_nov'] / max(m['a_cop'], 1e-6)
+    p_ratio = m['p_nov'] / max(m['p_cop'], 1e-6)
     print(f"\n{'='*60}\n  {tag}\n{'='*60}")
     print(f"  reconstruction ppl (gate)   = {m['ppl']:.1f}")
     print(f"  backbone ppl (edge hidden)  = {m['ppl_abl']:.1f}   "
           f"({'BACKBONE OK' if m['ppl_abl'] < 1000 else 'NO BACKBONE -> edge is a cheat sheet'})")
     print(f"  matched phrase spans        = {m['matched']}")
-    print(f"  --- ALPHA (gate) localization ------------------------------")
-    print(f"    alpha NOVEL  = {m['a_nov']:.4f}   alpha COPIED = {m['a_cop']:.4f}   "
-          f"ratio {m['a_nov']/max(m['a_cop'],1e-6):.2f}x")
-    print(f"  --- recon-gain localization --------------------------------")
-    print(f"    delta NOVEL  = {m['d_nov']:+.4f}  delta COPIED = {m['d_cop']:+.4f}  "
-          f"ratio {m['d_nov']/max(m['d_cop'],1e-6):.2f}x")
+    print(f"  --- POTENTIAL: where the edge COULD help (alpha=1 vs backbone) ----")
+    print(f"    pot NOVEL = {m['p_nov']:+.3f}   pot COPIED = {m['p_cop']:+.3f}   ratio {p_ratio:.2f}x")
+    print(f"      (>1.5x => the novelty SIGNAL exists; the edge inherently helps novel tokens)")
+    print(f"  --- LEARNED GATE: did alpha open on novel tokens? ----------------")
+    print(f"    alpha NOVEL = {m['a_nov']:.4f}  alpha COPIED = {m['a_cop']:.4f}  ratio {a_ratio:.2f}x")
     print("=" * 60)
-    if m['a_nov'] > 1.5 * max(m['a_cop'], 1e-6) and m['d_nov'] > 1.5 * max(m['d_cop'], 1e-6):
-        print("  THESIS SUPPORTED: gate opens on the ADDED content and the edge helps")
-        print("  it specifically -> 'what B adds' localized, with NO labels.")
-    elif m['a_nov'] > m['a_cop']:
-        print("  PARTIAL: gate leans novel but not decisively (try higher --beta).")
+    if a_ratio > 1.5 and m['a_nov'] > 0.05:
+        print("  THESIS SUPPORTED: the gate LEARNED to open on the added content -> 'what B")
+        print("  adds' localized with NO labels.")
+    elif p_ratio > 1.5:
+        print("  SIGNAL EXISTS but gate hasn't localized: the edge inherently helps novel")
+        print("  tokens (potential), yet the learned gate is flat. -> optimization issue")
+        print("  (tune beta / warmup), NOT a dead idea.")
     else:
-        print("  NEGATIVE: gate did not localize to the added content.")
+        print("  NO NOVELTY SIGNAL even at full edge: with teacher forcing the backbone")
+        print("  predicts novel tokens too -> rethink the target, not just the gate.")
     print("=" * 60)
 
 
@@ -174,28 +182,34 @@ def main():
     total = len(tl) * args.epochs
     sched = get_linear_schedule_with_warmup(opt, int(total * 0.06), total)
 
+    # beta WARMUP: ramp 0 -> beta over the first half of training, so the decoder first
+    # learns to USE the edge before the squeeze kicks in (prevents posterior collapse).
+    warmup = max(1, int(0.5 * total))
+    gstep = 0
     best = float("inf")
     for ep in range(1, args.epochs + 1):
         model.train(); run_r, run_a = 0.0, 0.0
         for step, (Aid, Am, Bid, Bm, _) in enumerate(tqdm(tl, desc=f"ep{ep}", leave=False)):
             Aid, Am, Bid, Bm = Aid.to(DEVICE), Am.to(DEVICE), Bid.to(DEVICE), Bm.to(DEVICE)
+            beta_t = args.beta * min(1.0, gstep / warmup)
             with autocast("cuda", enabled=AMP_ENABLED):
                 logits, _, alpha = model(Aid, Am, Bid, Bm, edge_dropout=args.edge_dropout)
                 L_rec = rec_loss(logits, Bid)
                 real = (Bm > 0).float()
                 L_spar = (alpha * real).sum() / real.sum().clamp(min=1)   # mean gate over real tokens
-                loss = L_rec + args.beta * L_spar
+                loss = L_rec + beta_t * L_spar
             scaler.scale(loss).backward()
             scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt); scaler.update(); opt.zero_grad(); sched.step()
-            run_r += L_rec.item(); run_a += L_spar.item()
+            run_r += L_rec.item(); run_a += L_spar.item(); gstep += 1
             if step > 0 and step % 200 == 0:
                 tqdm.write(f"  step {step} | L_rec={run_r/(step+1):.4f} "
-                           f"ppl={math.exp(run_r/(step+1)):.1f} | mean_alpha={run_a/(step+1):.3f}")
+                           f"ppl={math.exp(run_r/(step+1)):.1f} | mean_alpha={run_a/(step+1):.3f} "
+                           f"| beta_t={beta_t:.3f}")
         m = evaluate(model, vl, tok)
         print(f"  Epoch {ep} | ppl={m['ppl']:.1f} | ppl_abl={m['ppl_abl']:.1f} | "
-              f"alpha nov/cop={m['a_nov']:.3f}/{m['a_cop']:.3f} | "
-              f"recon-gain nov/cop={m['d_nov']:+.3f}/{m['d_cop']:+.3f}")
+              f"alpha nov/cop={m['a_nov']:.3f}/{m['a_cop']:.3f} (r{m['a_nov']/max(m['a_cop'],1e-6):.2f}) | "
+              f"potential nov/cop={m['p_nov']:+.2f}/{m['p_cop']:+.2f} (r{m['p_nov']/max(m['p_cop'],1e-6):.2f})")
         if m['ppl'] < best:
             best = m['ppl']; torch.save(model.state_dict(), MODEL_DIR / "novelty_ae_best.pt")
             print("   -> saved best")

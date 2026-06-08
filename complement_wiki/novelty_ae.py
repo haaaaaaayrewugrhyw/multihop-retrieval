@@ -84,7 +84,7 @@ class NoveltyAutoencoder(nn.Module):
 
     # ---- discriminator -----------------------------------------------------
     def forward(self, A_ids, A_mask, B_ids, B_mask, ablate_edge: bool = False,
-                edge_dropout: float = 0.0):
+                edge_dropout: float = 0.0, alpha_override: float = None):
         """Returns (logits [b,TB,V], E [b,TB,128], alpha [b,TB]). Predicts each b_t
         from b_<t (teacher) + A (free) + alpha*edge(one-ahead).
 
@@ -105,7 +105,10 @@ class NoveltyAutoencoder(nn.Module):
         if ablate_edge:
             edge_inj = torch.zeros_like(tok_emb)
         else:
-            edge_inj = alpha.unsqueeze(-1) * self.d_up(E)  # one-ahead: E[t] saw b_t
+            # alpha_override (diagnostic): force a constant gate (e.g. 1.0) to measure
+            # the edge's POTENTIAL value per token, independent of the learned gate.
+            use_alpha = alpha if alpha_override is None else torch.full_like(alpha, alpha_override)
+            edge_inj = use_alpha.unsqueeze(-1) * self.d_up(E)   # one-ahead: E[t] saw b_t
             if edge_dropout > 0.0 and self.training:
                 keep = (torch.rand(b, 1, 1, device=device) > edge_dropout).float()
                 edge_inj = edge_inj * keep                 # hide edge for some examples
