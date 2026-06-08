@@ -116,7 +116,8 @@ def evaluate(model, loader, tok, max_steps=200):
 def report(tag, m):
     print(f"\n{'='*60}\n  {tag}\n{'='*60}")
     print(f"  reconstruction ppl (gate)   = {m['ppl']:.1f}")
-    print(f"  reconstruction ppl (ablated)= {m['ppl_abl']:.1f}   recon-gain = {m['ppl_abl']-m['ppl']:.1f}")
+    print(f"  backbone ppl (edge hidden)  = {m['ppl_abl']:.1f}   "
+          f"({'BACKBONE OK' if m['ppl_abl'] < 1000 else 'NO BACKBONE -> edge is a cheat sheet'})")
     print(f"  matched phrase spans        = {m['matched']}")
     print(f"  --- ALPHA (gate) localization ------------------------------")
     print(f"    alpha NOVEL  = {m['a_nov']:.4f}   alpha COPIED = {m['a_cop']:.4f}   "
@@ -143,7 +144,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=3e-5)
-    ap.add_argument("--beta", type=float, default=0.10, help="sparsity squeeze on the gate")
+    ap.add_argument("--beta", type=float, default=0.30, help="sparsity squeeze on the gate")
+    ap.add_argument("--edge_dropout", type=float, default=0.5,
+                    help="prob of hiding the edge (forces the A+b_<t backbone)")
     ap.add_argument("--j_dec", type=int, default=2)
     args = ap.parse_args()
     if args.smoke:
@@ -151,7 +154,7 @@ def main():
         args.batch_size, args.epochs = 4, 1
         print("[smoke] tiny run")
 
-    print(f"Device: {DEVICE} | beta={args.beta}")
+    print(f"Device: {DEVICE} | beta={args.beta} | edge_dropout={args.edge_dropout}")
     trips = load_triples(max_examples=args.max_examples + args.val_examples, cache=not args.smoke)
     val, train = trips[:args.val_examples], trips[args.val_examples:]
     print(f"Train {len(train):,} | Val {len(val):,}")
@@ -177,7 +180,7 @@ def main():
         for step, (Aid, Am, Bid, Bm, _) in enumerate(tqdm(tl, desc=f"ep{ep}", leave=False)):
             Aid, Am, Bid, Bm = Aid.to(DEVICE), Am.to(DEVICE), Bid.to(DEVICE), Bm.to(DEVICE)
             with autocast("cuda", enabled=AMP_ENABLED):
-                logits, _, alpha = model(Aid, Am, Bid, Bm)
+                logits, _, alpha = model(Aid, Am, Bid, Bm, edge_dropout=args.edge_dropout)
                 L_rec = rec_loss(logits, Bid)
                 real = (Bm > 0).float()
                 L_spar = (alpha * real).sum() / real.sum().clamp(min=1)   # mean gate over real tokens

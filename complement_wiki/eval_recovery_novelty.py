@@ -119,16 +119,22 @@ def main():
         print(f"  {name:<20}{hits/n:>9.4f}{rr/n:>9.4f}")
     print("=" * 56)
     e = res["edge_novel (idea)"][0]; a = res["enc_A (floor)"][0]; b = res["enc_B (ceiling)"][0]
+    eall = res["edge_all"][0]
     print(f"  edge_novel vs enc_A(floor)  : {e-a:+.4f}")
     print(f"  edge_novel vs enc_B(ceiling): {e-b:+.4f}")
+    print(f"  edge_all   vs enc_B         : {eall-b:+.4f}  (edge_all == encode(B); ~0 expected)")
     print("=" * 56)
-    if e > a + 0.10:
-        print("  THESIS SUPPORTED: gated edge recovers 'what B adds' far above the A floor,")
-        print("  in a comparable space -- learned with NO labels.")
-    elif e > a + 0.02:
-        print("  PARTIAL: gated edge beats A floor modestly.")
+    # Honest bar: beating the A-floor is trivial (any chunk of B does). The gate only
+    # WORKS if the sparse novel subset approaches the full-B ceiling -> it kept the
+    # phrase tokens and dropped the rest.
+    if e > a + 0.10 and e > 0.85 * b:
+        print("  THESIS SUPPORTED: the SPARSE gated edge nearly matches the full-B ceiling")
+        print("  -> the gate kept the added content and dropped the copied -> 'what B adds', no labels.")
+    elif e > a + 0.05:
+        print("  WEAK: gated edge beats the A floor but is well below the ceiling -> the gate")
+        print("  is picking a generic chunk of B, NOT specifically the novel tokens. (raise --beta / check alpha-localization)")
     else:
-        print("  edge ~ A floor: the gated edge did not capture the added phrase.")
+        print("  NEGATIVE: gated edge ~ A floor.")
     print("=" * 56)
     return res
 

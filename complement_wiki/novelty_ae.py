@@ -83,9 +83,15 @@ class NoveltyAutoencoder(nn.Module):
         return E, alpha, H_A, (A_mask == 0)
 
     # ---- discriminator -----------------------------------------------------
-    def forward(self, A_ids, A_mask, B_ids, B_mask, ablate_edge: bool = False):
+    def forward(self, A_ids, A_mask, B_ids, B_mask, ablate_edge: bool = False,
+                edge_dropout: float = 0.0):
         """Returns (logits [b,TB,V], E [b,TB,128], alpha [b,TB]). Predicts each b_t
-        from b_<t (teacher) + A (free) + alpha*edge(one-ahead)."""
+        from b_<t (teacher) + A (free) + alpha*edge(one-ahead).
+
+        edge_dropout (train only): with this prob, hide the edge for an example so the
+        decoder is FORCED to learn the A + b_<t backbone -> the edge then only matters
+        where the backbone fails (novel tokens), which is what lets the gate localize.
+        Without it the edge becomes a universal cheat sheet and the gate never closes."""
         E, alpha, H_A, A_pad = self.generate_edge(A_ids, A_mask, B_ids, B_mask)
         b, TB = B_ids.shape
         device = B_ids.device
@@ -96,8 +102,13 @@ class NoveltyAutoencoder(nn.Module):
         tok_emb = self.bert.embeddings.word_embeddings(shifted)
         pos_emb = self.d_pos(torch.arange(TB, device=device).unsqueeze(0))
 
-        edge_inj = torch.zeros_like(tok_emb) if ablate_edge \
-            else (alpha.unsqueeze(-1) * self.d_up(E))      # one-ahead: E[t] saw b_t
+        if ablate_edge:
+            edge_inj = torch.zeros_like(tok_emb)
+        else:
+            edge_inj = alpha.unsqueeze(-1) * self.d_up(E)  # one-ahead: E[t] saw b_t
+            if edge_dropout > 0.0 and self.training:
+                keep = (torch.rand(b, 1, 1, device=device) > edge_dropout).float()
+                edge_inj = edge_inj * keep                 # hide edge for some examples
         dec_in = tok_emb + pos_emb + edge_inj
 
         causal = nn.Transformer.generate_square_subsequent_mask(TB, device=device)
