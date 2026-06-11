@@ -173,7 +173,7 @@ def train_decoder(g_model, dec_model, train_pairs, tok,
                   steps=1000, bs=16, lr=1e-4, log_every=100,
                   device='cuda'):
     dl  = DataLoader(DecoderDS(train_pairs), batch_size=bs, shuffle=True,
-                     collate_fn=make_collate(tok), num_workers=2, pin_memory=True)
+                     collate_fn=make_collate(tok), num_workers=0)
     opt = torch.optim.Adam(dec_model.parameters(), lr=lr)
 
     g_model.eval()
