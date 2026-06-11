@@ -216,22 +216,41 @@ python run.py --n 500 --steps 500 --lam_s 1.0 --lam_spec 1.0 --margin 2.0 --beta
 
 ```
 delta_system/
-├── SYSTEM.md        ← THIS FILE — read first every session
-├── data.py          ← MuSiQue pair loader (loads from retrieval/data/musique/)
-├── model.py         ← DeltaSystem: G + D_recon (62.6M trainable params)
-├── losses.py        ← recon_loss, sparsity_loss, gate_loss (unused), specificity_loss
-├── train.py         ← Training loop + argument parser
-├── eval.py          ← 3-metric evaluation with exact token boundary labels
-├── run.py           ← Entry point (--smoke, --eval-only, --n, --steps, etc.)
+├── SYSTEM.md           ← THIS FILE — read first every session
+├── data.py             ← MuSiQue pair loader (loads from retrieval/data/musique/)
+├── model.py            ← DeltaSystem: G + D_recon (62.6M trainable params)
+├── losses.py           ← recon_loss, sparsity_loss, gate_loss (unused), specificity_loss
+├── train.py            ← Training loop + argument parser
+├── eval.py             ← 3-metric evaluation with exact token boundary labels
+├── run.py              ← Entry point (--smoke, --eval-only, --n, --steps, etc.)
+├── baseline.py         ← Naive mean-pool baseline for comparison
+├── delta_decoder.py    ← DeltaDecoder: δ_0 → novel text (causal decoder, 2 layers)
+│                          Classes: DeltaDecoder | Functions: train_decoder, show_examples
+├── kaggle_notebook.ipynb  ← Full Kaggle pipeline (cells 1-12)
+│                             Cells 1-9: G training + eval (Wikipedia, 8000/1000)
+│                             Cells 10-12: DeltaDecoder train + qualitative demo
+├── kaggle_train.py     ← Standalone training script (alternative to notebook)
 └── checkpoints/
-    └── val_model.pt ← Saved trainable params only (no BERT — strict=False to load)
+    ├── val_model.pt       ← Local G checkpoint (trainable params only, strict=False)
+    ├── kaggle_model.pt    ← Kaggle G checkpoint (/kaggle/working/checkpoints/)
+    └── delta_decoder.pt   ← Decoder checkpoint (/kaggle/working/checkpoints/)
 ```
 
 ---
 
 ## WHAT'S NEXT (Priority Order)
 
-### 0. ✅ DONE — Held-out generalization test (LOCAL)
+### ✅ DONE — Kaggle Wikipedia scale experiment (8000 train / 1000 held-out)
+Command: kaggle_notebook.ipynb — wikimedia/wikipedia paragraph pairs
+Results (HELD-OUT, 1000 unseen pairs):
+  DELTA_PPL  : +733   PASS  ← delta helps on unseen data
+  SPECIFICITY: +583   PASS  ← pair-specific on unseen data
+  AUROC      : 0.496  (diagnostic, ~random as expected)
+In-sample (200 train pairs): DELTA_PPL +611, SPEC +453
+KEY FINDING: held-out beats in-sample (+733 > +611) — genuine generalization, not memorization.
+500 examples overfit → 8000 examples generalize cleanly. Architecture proven at scale.
+
+### ✅ DONE — Held-out generalization test (LOCAL)
 Train 500 / Eval 100 unseen pairs:
   DELTA_PPL = -15  FAIL  (delta hurts on unseen pairs — G/D_recon overfit communication)
   SPECIFICITY = +9298  PASS  (correct delta still beats wrong delta even on unseen)
@@ -253,13 +272,23 @@ Cross-attention G:    PPL_with=57,  DELTA_PPL=+372, AUROC=0.484, SPEC=+2951
 Finding: cross-attention extracts 3x richer delta (57 vs 173 PPL). AUROC≈0.5 for BOTH.
 AUROC dropped from pass/fail gate → diagnostic only. Two real metrics: DELTA_PPL + SPECIFICITY.
 
-### 3. δ decoder — THE KILLER DEMO (LOCAL prototype, KAGGLE for training)
-A small separate decoder that takes δ alone (no A, no D_recon) and generates text.
-Goal: given (A, B), can we read WHAT is novel from δ?
-This is the thesis result. Currently we only prove δ statistically carries novelty.
-We cannot SHOW what it says. The decoder makes it visible.
+### 3. ✅ DONE — δ decoder (KAGGLE)
+Input: δ_0 (bottleneck, 768-dim global novelty summary from trained G)
+Target: generate novel paragraph text from δ_0 alone (no A, no D_recon)
+Architecture: small causal decoder (2 layers), δ_0 as single memory token
+Training: load frozen G from kaggle_model.pt (strict=False), freeze G, train only DeltaDecoder
+Loss: cross-entropy on novel paragraph tokens (teacher-forced)
+Inference: greedy decode from δ_0 until [SEP] or 60 tokens
+Evaluation: qualitative — 10 held-out pairs, show A | true novel | decoded δ
+Files: delta_decoder.py (new), kaggle_notebook.ipynb (cells 10-12 added)
+Checkpoints: /kaggle/working/checkpoints/delta_decoder.pt (decoder only)
 
-### 4. Scale to NewsEdits (KAGGLE)
+What "good" looks like:
+  - Decoded text mentions similar topics/entities as the true novel paragraph
+  - Different pairs → different decoded text (not collapsed)
+  - Decoded text ≠ A text (genuinely novel, not copied from known context)
+
+### 4. → NEXT — Scale to NewsEdits (KAGGLE)
 - Build NewsEdits data loader
 - Train on 10K→100K examples
 - Push delta_system/ to GitHub, pull into Kaggle notebook
