@@ -56,7 +56,9 @@ class DeltaDecoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.word_emb = nn.Embedding(VOCAB_SIZE, D_MODEL, padding_idx=PAD_ID)
+        nn.init.normal_(self.word_emb.weight, std=0.02)  # small init — default N(0,1) explodes logits
         self.pos_emb  = nn.Embedding(MAX_SEQ, D_MODEL)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
         self.d0_proj  = nn.Linear(D_MODEL, D_MODEL)
 
         dec_layer = nn.TransformerDecoderLayer(
@@ -66,6 +68,16 @@ class DeltaDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=N_DEC_LAYERS)
         self.lm_head = nn.Linear(D_MODEL, VOCAB_SIZE, bias=False)
         self.lm_head.weight = self.word_emb.weight   # tie weights
+
+    def copy_bert_embeddings(self, bert_model):
+        """Copy BERT's token + position embeddings — gives decoder a meaningful vocabulary head-start."""
+        with torch.no_grad():
+            self.word_emb.weight.data.copy_(
+                bert_model.embeddings.word_embeddings.weight.data)
+            # Copy BERT positional embeddings up to MAX_SEQ
+            bert_pos = bert_model.embeddings.position_embeddings.weight.data
+            n = min(MAX_SEQ, bert_pos.size(0))
+            self.pos_emb.weight.data[:n].copy_(bert_pos[:n])
 
     def forward(self, delta_0, novel_ids, novel_mask):
         """
@@ -201,8 +213,9 @@ def train_decoder(g_model, dec_model, train_pairs, tok,
             step += 1
 
             if step % log_every == 0 or step == 1:
-                ppl = math.exp(min(loss.item(), 20))
-                print(f'  step {step:4d}/{steps} | dec_ppl={ppl:.1f}')
+                raw = loss.item()
+                ppl = math.exp(min(raw, 20))
+                print(f'  step {step:4d}/{steps} | loss={raw:.3f} | dec_ppl={ppl:.1f}')
 
     return dec_model
 
