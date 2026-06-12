@@ -135,8 +135,21 @@ def load_newsedits_pairs(db_path: str, n_pairs=1000,
     Returns:
         pairs       : list of {'A':str, 'B':str, 'novel':str, 'num_added':int}
     """
+    import time
     print(f"Opening NewsEdits database: {db_path}")
     conn = sqlite3.connect(db_path)
+
+    # Create indexes so queries run in milliseconds instead of seconds
+    print("Creating indexes (one-time, ~30 sec)...")
+    t0 = time.time()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ms_triple "
+                 "ON matched_sentences(entry_id, version_x, version_y)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ms_sent_y "
+                 "ON matched_sentences(entry_id, version_y, sent_idx_y)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ss_entry_ver "
+                 "ON split_sentences(entry_id, version)")
+    conn.commit()
+    print(f"  Indexes ready in {time.time()-t0:.0f}s")
 
     print("Loading revision pair index...")
     all_pairs = _get_version_pairs(conn)
@@ -144,10 +157,22 @@ def load_newsedits_pairs(db_path: str, n_pairs=1000,
 
     pairs   = []
     checked = 0
+    t_start = time.time()
+    LOG_EVERY = 500   # print progress every 500 checked revisions
+
     for entry_id, version_x, version_y in all_pairs:
         if len(pairs) >= n_pairs:
             break
         checked += 1
+
+        # Progress log so you can see the script is alive
+        if checked % LOG_EVERY == 0:
+            elapsed  = time.time() - t_start
+            rate     = checked / elapsed if elapsed > 0 else 0
+            eta      = (len(all_pairs) - checked) / rate if rate > 0 else 0
+            print(f"  checked {checked:,}/{len(all_pairs):,} | "
+                  f"collected {len(pairs)}/{n_pairs} | "
+                  f"{rate:.0f} rev/s | ETA {eta/60:.0f} min")
 
         preserved = _get_preserved_sentences(conn, entry_id, version_x, version_y)
         added     = _get_added_sentences(conn, entry_id, version_x, version_y)
@@ -164,7 +189,6 @@ def load_newsedits_pairs(db_path: str, n_pairs=1000,
         if len(A_text) < 80 or len(novel_text) < 40:
             continue
 
-        # Truncate to avoid tokenizer overflow
         A_text     = A_text[:max_len_chars]
         novel_text = novel_text[:max_len_chars]
 
@@ -175,13 +199,14 @@ def load_newsedits_pairs(db_path: str, n_pairs=1000,
             'num_added': num_added,
         })
 
-        if len(pairs) % 100 == 0 and len(pairs) > 0:
-            print(f"  Collected {len(pairs)}/{n_pairs} "
-                  f"(checked {checked:,} revisions)...")
+        if len(pairs) % 100 == 0:
+            print(f"  *** Collected {len(pairs)}/{n_pairs} pairs so far ***")
 
     conn.close()
-    print(f"Loaded {len(pairs)} pairs "
-          f"(checked {checked:,} revisions, {len(pairs)/max(checked,1)*100:.1f}% pass rate)")
+    elapsed = time.time() - t_start
+    print(f"Loaded {len(pairs)} pairs from {checked:,} revisions "
+          f"in {elapsed/60:.1f} min "
+          f"({len(pairs)/max(checked,1)*100:.1f}% pass rate)")
     return pairs
 
 
