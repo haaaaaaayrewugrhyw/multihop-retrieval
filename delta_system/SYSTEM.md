@@ -288,7 +288,20 @@ What "good" looks like:
   - Different pairs → different decoded text (not collapsed)
   - Decoded text ≠ A text (genuinely novel, not copied from known context)
 
-### 4. → NEXT — Scale to NewsEdits (KAGGLE)
+### 4. ✅ DONE — HotpotQA second-dataset validation (KAGGLE)
+Data: HotpotQA (Yang et al. 2018), distractor setting. 5000 train / 500 held-out.
+A = first supporting paragraph, novel = second supporting paragraph.
+Results (HELD-OUT, 500 unseen pairs):
+  DELTA_PPL  : +480   PASS  ← delta helps on unseen multi-hop pairs
+  SPECIFICITY: +2547  PASS  ← pair-specific on unseen pairs
+  AUROC      : 0.515  (diagnostic, ~random as expected)
+In-sample (200 train pairs): DELTA_PPL +364, SPEC +1689
+KEY: held-out beats in-sample (+480 > +364, +2547 > +1689) — genuine generalization.
+KEY: SPECIFICITY 4× higher than Wikipedia (+2547 vs +608) — HotpotQA pairs are from
+different articles (more semantically distinct), so wrong delta is much worse.
+TWO-DATASET VALIDATION COMPLETE. Same architecture. Same hyperparameters. Both PASS.
+
+### 5. → NEXT — Scale to NewsEdits (KAGGLE)
 - Build NewsEdits data loader
 - Train on 10K→100K examples
 - Push delta_system/ to GitHub, pull into Kaggle notebook

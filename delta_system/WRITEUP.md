@@ -267,6 +267,36 @@ Loss started at 10.02 nats (correct — ln(30522) ≈ 10.3 is random baseline) a
 
 ---
 
+### Experiment 5: Cross-Dataset Generalization (HotpotQA, Kaggle)
+
+**Data:** HotpotQA (Yang et al., 2018), distractor setting. A = first supporting paragraph, novel = second supporting paragraph, B = A + novel. 5000 training pairs, 500 held-out pairs.
+
+HotpotQA is structurally different from Wikipedia: pairs connect paragraphs from *different* articles via a reasoning chain, rather than consecutive paragraphs of the same article. This tests whether the architecture generalizes across dataset types with zero changes.
+
+**Setup:** Identical architecture and hyperparameters to Wikipedia experiment.
+
+| Split | DELTA_PPL | SPECIFICITY | AUROC | Pass? |
+|-------|-----------|-------------|-------|-------|
+| In-sample (200 pairs) | +364 | +1689 | 0.510 | ✅ PASS |
+| **Held-out (500 pairs)** | **+480** | **+2547** | 0.515 | ✅ **PASS** |
+
+**Key findings:**
+
+Held-out beats in-sample for both metrics (+480 > +364, +2547 > +1689) — the same generalization pattern as Wikipedia. Genuine learning, not memorization, across both datasets.
+
+SPECIFICITY is 4× higher on HotpotQA (+2547 vs +608). HotpotQA pairs link paragraphs from different articles, making pairs more semantically distinct. When the wrong delta is used, reconstruction degrades much more severely than on same-article Wikipedia pairs.
+
+**Cross-dataset summary:**
+
+| Dataset | Structure | DELTA_PPL | SPECIFICITY | Pass? |
+|---------|-----------|-----------|-------------|-------|
+| Wikipedia | Encyclopedic, same-article paragraphs | +755 | +608 | ✅ PASS |
+| HotpotQA | Multi-hop reasoning, cross-article | +480 | +2547 | ✅ PASS |
+
+Same architecture. Same hyperparameters. Zero novelty labels. Two-dataset validation complete.
+
+---
+
 ## 7. What Was Tried and Abandoned
 
 ### Explicit Per-Position Gate
@@ -289,9 +319,11 @@ Added a gating network `g_gate: Linear(768,384) → GELU → Linear(384,1) → S
 
 3. **Generalization requires data scale.** 500 training pairs → overfit communication (held-out DELTA_PPL = −15). 8000 training pairs → genuine generalization (held-out DELTA_PPL = +755, exceeding in-sample performance).
 
-4. **delta_0 encodes readable novelty.** A 230-dim bottleneck of BERT's mean representation is sufficient for a decoder to generate domain-correct novel text from delta_0 alone, with no access to A or the full delta sequence.
+4. **Generalizes across dataset types.** Validated on two structurally different datasets — Wikipedia encyclopedic paragraphs and HotpotQA cross-article multi-hop pairs — with no architecture or hyperparameter changes. Both PASS. Held-out beats in-sample on both datasets.
 
-5. **Positional localization needs token-level supervision.** AUROC ≈ 0.5 for both the full G and the naive baseline. Within-sequence localization of novelty does not emerge from reconstruction loss alone. This is a principled finding: the reconstruction objective teaches what is novel (DELTA_PPL), not where it is (AUROC).
+5. **delta_0 encodes readable novelty.** A 230-dim bottleneck of BERT's mean representation is sufficient for a decoder to generate domain-correct novel text from delta_0 alone, with no access to A or the full delta sequence.
+
+6. **Positional localization needs token-level supervision.** AUROC ≈ 0.5 for both the full G and the naive baseline. Within-sequence localization of novelty does not emerge from reconstruction loss alone. This is a principled finding: the reconstruction objective teaches what is novel (DELTA_PPL), not where it is (AUROC).
 
 ---
 
