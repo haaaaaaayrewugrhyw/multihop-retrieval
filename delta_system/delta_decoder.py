@@ -109,14 +109,16 @@ class DeltaDecoder(nn.Module):
         return self.lm_head(out)   # [b, T, VOCAB_SIZE]
 
     @torch.no_grad()
-    def greedy_decode(self, delta_0, max_len=60):
+    def greedy_decode(self, delta_0, max_len=60, rep_penalty_window=5):
         """
         Generate novel text greedily from δ_0 alone.
         Stops at [SEP] or max_len.
+        rep_penalty_window: set logit of any token seen in the last N steps to -inf
+                            (prevents "hiring hiring hiring..." loops).
         """
         b   = delta_0.size(0)
         dev = delta_0.device
-        memory  = self.d0_proj(delta_0).unsqueeze(1)       # [b, 1, 768]
+        memory  = self.d0_proj(delta_0).unsqueeze(1)
         mem_pad = torch.zeros(b, 1, dtype=torch.bool, device=dev)
 
         tokens = torch.full((b, 1), BOS_ID, dtype=torch.long, device=dev)
@@ -129,7 +131,15 @@ class DeltaDecoder(nn.Module):
             out    = self.decoder(tgt=tgt, memory=memory,
                                   tgt_mask=causal,
                                   memory_key_padding_mask=mem_pad)
-            next_id = self.lm_head(out[:, -1, :]).argmax(-1, keepdim=True)  # [b, 1]
+            logits = self.lm_head(out[:, -1, :])   # [b, vocab]
+
+            # Repetition penalty: suppress tokens seen in recent window
+            if rep_penalty_window > 0 and tokens.size(1) > 1:
+                recent = tokens[:, -rep_penalty_window:]   # [b, window]
+                for bi in range(b):
+                    logits[bi, recent[bi]] = float('-inf')
+
+            next_id = logits.argmax(-1, keepdim=True)   # [b, 1]
             tokens  = torch.cat([tokens, next_id], dim=1)
             if (next_id == SEP_ID).all():
                 break
@@ -226,24 +236,30 @@ def train_decoder(g_model, dec_model, train_pairs, tok,
 def show_examples(g_model, dec_model, pairs, tok, n=10, device='cuda'):
     """
     Print side-by-side: A (first 80 chars) | True novel | Decoded novel
+
+    Strides through pairs instead of taking first N so that examples come from
+    different articles (consecutive pairs in Wikipedia data are same article).
     """
     g_model.eval()
     dec_model.eval()
 
+    # Stride-sample for diversity across articles
+    stride  = max(1, len(pairs) // n)
+    sampled = [pairs[i * stride] for i in range(n) if i * stride < len(pairs)]
+
     print('\n' + '=' * 70)
     print('  δ DECODER — QUALITATIVE EXAMPLES')
     print('  Input: δ_0 only (no A, no D_recon)')
+    print(f'  Sampled from {len(pairs)} pairs (stride={stride} for article diversity)')
     print('=' * 70)
 
-    for i, pair in enumerate(pairs[:n]):
-        A_ids  = tok(pair['A'],     max_length=MAX_LEN, truncation=True,
-                     return_tensors='pt')['input_ids'].to(device)
-        A_mask = tok(pair['A'],     max_length=MAX_LEN, truncation=True,
-                     return_tensors='pt')['attention_mask'].to(device)
-        B_ids  = tok(pair['B'],     max_length=MAX_LEN, truncation=True,
-                     return_tensors='pt')['input_ids'].to(device)
-        B_mask = tok(pair['B'],     max_length=MAX_LEN, truncation=True,
-                     return_tensors='pt')['attention_mask'].to(device)
+    for i, pair in enumerate(sampled):
+        encA = tok(pair['A'], max_length=MAX_LEN, truncation=True, return_tensors='pt')
+        encB = tok(pair['B'], max_length=MAX_LEN, truncation=True, return_tensors='pt')
+        A_ids  = encA['input_ids'].to(device)
+        A_mask = encA['attention_mask'].to(device)
+        B_ids  = encB['input_ids'].to(device)
+        B_mask = encB['attention_mask'].to(device)
 
         H_A = g_model._enc(A_ids, A_mask)
         H_B = g_model._enc(B_ids, B_mask)
