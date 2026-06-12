@@ -168,32 +168,66 @@ def make_gold_labels(example: dict, tok: BertTokenizerFast):
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
-def load_pairs(n: int, min_insert: int, max_insert_ratio: float,
-               tok: BertTokenizerFast):
+def _stream_wiki_atomic():
     """
-    Stream WikiAtomicEdits English insertions, filter, build gold labels.
-    Returns list of dicts: {A, B, labels, real_len}
+    Try WikiAtomicEdits English insertions via several loading strategies.
+    Returns (dataset_iterator, field_map) or raises RuntimeError.
+
+    field_map maps our keys to dataset field names:
+      base_sentence, edited_sentence, phrase
     """
-    print("Loading google-research-datasets/wiki_atomic_edits "
-          "(english_insertions, streaming)...")
-    try:
-        ds = load_dataset("google-research-datasets/wiki_atomic_edits",
-                          "english_insertions", split="train", streaming=True)
-    except Exception:
-        # Some versions use a different config name
-        ds = load_dataset("google-research-datasets/wiki_atomic_edits",
-                          split="train", streaming=True)
+    configs_to_try = [
+        ("google-research-datasets/wiki_atomic_edits", "english_insertions"),
+        ("google-research-datasets/wiki_atomic_edits", None),
+    ]
+    for repo, cfg in configs_to_try:
+        for trust in (True, False):
+            kwargs = dict(split="train", streaming=True)
+            if cfg:
+                kwargs["name"] = cfg
+            if trust:
+                kwargs["trust_remote_code"] = True
+            try:
+                ds = load_dataset(repo, **kwargs)
+                print(f"  Loaded via {repo} cfg={cfg} trust={trust}")
+                return ds, {"base": "base_sentence",
+                            "edited": "edited_sentence",
+                            "phrase": "phrase"}
+            except Exception as e:
+                print(f"  Attempt failed ({repo}, cfg={cfg}, trust={trust}): "
+                      f"{type(e).__name__}")
+
+    raise RuntimeError("WikiAtomicEdits unavailable — see below for IteraTeR fallback")
+
+
+def _load_iterater(n: int, min_insert: int, max_insert_ratio: float,
+                   tok: BertTokenizerFast):
+    """
+    Fallback: IteraTeR human-annotated sentences (wanyu/IteraTeR_human_sent).
+    Uses 'meaning-changed' examples only — these are genuine content insertions.
+    Gold spans derived via difflib (no explicit phrase field in this dataset).
+    """
+    print("Falling back to wanyu/IteraTeR_human_sent (meaning-changed only)...")
+    ds = load_dataset("wanyu/IteraTeR_human_sent", split="train", streaming=True)
 
     pairs, checked = [], 0
     for ex in ds:
         checked += 1
-        base   = (ex.get("base_sentence") or "").strip()
-        edited = (ex.get("edited_sentence") or "").strip()
+
+        # Keep only 'meaning-changed' — new factual content was inserted
+        labels_field = ex.get("labels") or []
+        if isinstance(labels_field, str):
+            labels_field = [labels_field]
+        if not any("meaning" in str(l).lower() for l in labels_field):
+            continue
+
+        base   = (ex.get("before_sent") or "").strip()
+        edited = (ex.get("after_sent")  or "").strip()
 
         if len(base) < 20 or len(edited) < 20:
             continue
         if len(edited) <= len(base):
-            continue  # must be an insertion (edited longer)
+            continue
 
         insert_len = len(edited) - len(base)
         if insert_len < min_insert:
@@ -201,21 +235,77 @@ def load_pairs(n: int, min_insert: int, max_insert_ratio: float,
         if insert_len / max(len(edited), 1) > max_insert_ratio:
             continue
 
-        labels, real_len = make_gold_labels(ex, tok)
-        if labels is None:
+        # No phrase field — use difflib
+        ex_fake = {"base_sentence": base, "edited_sentence": edited, "phrase": ""}
+        gold_labels, real_len = make_gold_labels(ex_fake, tok)
+        if gold_labels is None:
             continue
 
         pairs.append({"A": base, "B": edited,
-                      "labels": labels, "real_len": real_len})
-
+                      "labels": gold_labels, "real_len": real_len})
         if len(pairs) >= n:
             break
-        if checked % 10000 == 0:
+        if checked % 1000 == 0:
             print(f"  checked {checked:,} | collected {len(pairs)}/{n}")
 
-    print(f"Loaded {len(pairs)} usable pairs from {checked:,} examples "
-          f"({len(pairs)/max(checked,1)*100:.1f}% pass rate)")
+    print(f"IteraTeR: {len(pairs)} pairs from {checked:,} examples")
     return pairs
+
+
+def load_pairs(n: int, min_insert: int, max_insert_ratio: float,
+               tok: BertTokenizerFast):
+    """
+    Load insertion pairs with gold labels. Tries WikiAtomicEdits first,
+    falls back to IteraTeR if WikiAtomicEdits is unavailable.
+    Returns list of dicts: {A, B, labels, real_len}
+    """
+    # ── Try WikiAtomicEdits ────────────────────────────────────────────────────
+    wiki_ok = False
+    try:
+        ds, fmap = _stream_wiki_atomic()
+        wiki_ok = True
+        print("Source: WikiAtomicEdits English insertions")
+    except RuntimeError as e:
+        print(f"WikiAtomicEdits unavailable: {e}")
+
+    if wiki_ok:
+        pairs, checked = [], 0
+        for ex in ds:
+            checked += 1
+            base   = (ex.get(fmap["base"])   or "").strip()
+            edited = (ex.get(fmap["edited"]) or "").strip()
+
+            if len(base) < 20 or len(edited) < 20:
+                continue
+            if len(edited) <= len(base):
+                continue
+
+            insert_len = len(edited) - len(base)
+            if insert_len < min_insert:
+                continue
+            if insert_len / max(len(edited), 1) > max_insert_ratio:
+                continue
+
+            # Inject phrase field into a dict make_gold_labels can use
+            ex_norm = {"base_sentence": base, "edited_sentence": edited,
+                       "phrase": (ex.get(fmap["phrase"]) or "")}
+            gold_labels, real_len = make_gold_labels(ex_norm, tok)
+            if gold_labels is None:
+                continue
+
+            pairs.append({"A": base, "B": edited,
+                          "labels": gold_labels, "real_len": real_len})
+            if len(pairs) >= n:
+                break
+            if checked % 10000 == 0:
+                print(f"  checked {checked:,} | collected {len(pairs)}/{n}")
+
+        print(f"Loaded {len(pairs)} pairs from {checked:,} examples "
+              f"({len(pairs)/max(checked,1)*100:.1f}% pass rate)")
+        return pairs
+
+    # ── Fallback: IteraTeR ─────────────────────────────────────────────────────
+    return _load_iterater(n, min_insert, max_insert_ratio, tok)
 
 
 # ── Method 1: delta_system ─────────────────────────────────────────────────────
@@ -523,7 +613,7 @@ def main():
     print(f"  {'Wikipedia (8000tr/1000ev)':<35} {'DELTA_PPL':>14} {'  +755':>8}  same domain")
     print(f"  {'HotpotQA (5000tr/500ev)':<35} {'DELTA_PPL':>14} {'  +480':>8}  cross-dataset")
     print(f"  {'NewsEdits AP (0tr/500ev)':<35} {'DELTA_PPL':>14} {' +1295':>8}  cross-domain")
-    print(f"  {'WikiAtomicEdits (0tr/{args.n}ev)':<35} "
+    print(f"  {'Token eval (0tr/{args.n}ev)':<35} "
           f"{'Token AUC':>14} {ds_r['auc']:>+8.4f}  zero-shot token F1")
     print("=" * 70)
 
