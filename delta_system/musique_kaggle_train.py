@@ -1,17 +1,24 @@
 """
-musique_kaggle_train.py -- MuSiQue second-dataset validation on Kaggle.
+musique_kaggle_train.py -- HotpotQA second-dataset validation on Kaggle.
+
+HotpotQA (Yang et al. 2018) — same multi-hop reasoning structure as MuSiQue,
+~6000 citations, freely available on HuggingFace. No download issues.
+
+    A     = first supporting paragraph  (what is already known)
+    B     = first + second paragraph    (the new document)
+    novel = second supporting paragraph (ground-truth novelty)
 
 Run on Kaggle with two cells only:
 
     # Cell 1
-    !pip install transformers scikit-learn -q
+    !pip install transformers scikit-learn datasets -q
     !git clone https://github.com/haaaaaaayrewugrhyw/multihop-retrieval.git /kaggle/working/repo
 
     # Cell 2
     !python /kaggle/working/repo/delta_system/musique_kaggle_train.py
 
-Downloads MuSiQue automatically. Trains G on 5000 pairs, evaluates on 500
-held-out, prints cross-dataset comparison against Wikipedia results.
+Trains G on 5000 HotpotQA pairs, evaluates on 500 held-out,
+prints cross-dataset comparison against Wikipedia results.
 """
 
 import json
@@ -43,76 +50,51 @@ LAM_SPEC  = 1.0
 MARGIN    = 2.0
 LOG_EVERY = 200
 
-# ── Download MuSiQue ──────────────────────────────────────────────────────────
+# ── Load HotpotQA pairs ───────────────────────────────────────────────────────
 
-def download_musique():
-    data_dir  = Path("/kaggle/working/musique")
-    data_dir.mkdir(exist_ok=True)
-    jsonl_path = data_dir / "musique_ans_v1.0_train.jsonl"
+def load_hotpotqa_pairs(n_train=5000, n_eval=500):
+    """
+    HotpotQA (Yang et al. 2018) — multi-hop QA with two supporting paragraphs.
+    A = first supporting paragraph, novel = second, B = A + novel.
+    Available on HuggingFace — no download needed.
+    """
+    from datasets import load_dataset
 
-    if jsonl_path.exists():
-        print(f"Data already present: {jsonl_path}")
-        return jsonl_path
-
-    print("Downloading MuSiQue from GitHub...")
-    zip_path = Path("/kaggle/working/musique.zip")
-
-    urls = [
-        "https://github.com/StonyBrookNLP/musique/releases/download/v1.0/musique_v1.0.zip",
-        "https://github.com/StonyBrookNLP/musique/releases/download/v0.0.1/musique_v1.0.zip",
-    ]
-    for url in urls:
-        ret = os.system(f'wget -q "{url}" -O "{zip_path}"')
-        if ret == 0 and zip_path.exists() and zip_path.stat().st_size > 1e6:
-            print(f"  Downloaded from {url}")
-            break
-    else:
-        raise RuntimeError(
-            "MuSiQue download failed from all URLs.\n"
-            "Manual fix: upload musique_ans_v1.0_train.jsonl to /kaggle/working/musique/"
-        )
-
-    extract_dir = Path("/kaggle/working/musique_raw")
-    os.system(f'unzip -q "{zip_path}" -d "{extract_dir}"')
-
-    found = list(extract_dir.rglob("musique_ans_v1.0_train.jsonl"))
-    if not found:
-        all_jsonl = list(extract_dir.rglob("*.jsonl"))
-        raise RuntimeError(
-            f"musique_ans_v1.0_train.jsonl not found in zip.\n"
-            f"Files found: {[str(f) for f in all_jsonl]}"
-        )
-
-    os.system(f'cp "{found[0]}" "{jsonl_path}"')
-    print(f"  Saved to {jsonl_path} ({jsonl_path.stat().st_size/1e6:.1f} MB)")
-    return jsonl_path
-
-
-# ── Load pairs ────────────────────────────────────────────────────────────────
-
-def load_musique_pairs(jsonl_path, n_train=5000, n_eval=500):
     total = n_train + n_eval
-    pairs = []
-    with open(jsonl_path, encoding="utf-8") as fh:
-        for line in fh:
-            ex     = json.loads(line)
-            decomp = ex.get("question_decomposition", [])
-            if len(decomp) != 2:
-                continue
-            paras = {p["idx"]: p["paragraph_text"].strip() for p in ex["paragraphs"]}
-            idx1  = decomp[0].get("paragraph_support_idx")
-            idx2  = decomp[1].get("paragraph_support_idx")
-            if idx1 is None or idx2 is None:
-                continue
-            A     = paras.get(idx1, "").strip()
-            novel = paras.get(idx2, "").strip()
-            if not A or not novel:
-                continue
-            pairs.append({"A": A, "B": A + " " + novel, "novel": novel})
-            if len(pairs) >= total:
-                break
+    print("Loading HotpotQA from HuggingFace (distractor setting, train split)...")
+    ds = load_dataset("hotpot_qa", "distractor", split="train", streaming=True)
 
-    print(f"Loaded {len(pairs)} 2-hop pairs  ({n_train} train / {n_eval} eval)")
+    pairs = []
+    for ex in ds:
+        # Get unique supporting paragraph titles in order
+        sup_titles = []
+        for title in ex["supporting_facts"]["title"]:
+            if title not in sup_titles:
+                sup_titles.append(title)
+        if len(sup_titles) < 2:
+            continue
+
+        # Build paragraph text from sentence lists
+        context_dict = {}
+        for title, sents in zip(ex["context"]["title"], ex["context"]["sentences"]):
+            context_dict[title] = " ".join(sents).strip()
+
+        A     = context_dict.get(sup_titles[0], "").strip()
+        novel = context_dict.get(sup_titles[1], "").strip()
+
+        if len(A) < 50 or len(novel) < 50:
+            continue
+        if len(A) > 1500 or len(novel) > 1500:
+            continue
+
+        pairs.append({"A": A, "B": A + " " + novel, "novel": novel})
+        if len(pairs) >= total:
+            break
+
+        if len(pairs) % 1000 == 0 and len(pairs) > 0:
+            print(f"  Collected {len(pairs)}/{total}...")
+
+    print(f"Loaded {len(pairs)} HotpotQA pairs  ({n_train} train / {n_eval} eval)")
     return pairs[:n_train], pairs[n_train:total]
 
 
@@ -174,15 +156,15 @@ def train(model, train_pairs, tok):
 
 def main():
     print("=" * 62)
-    print("DELTA SYSTEM — MuSiQue Validation (Second Dataset)")
+    print("DELTA SYSTEM — HotpotQA Validation (Second Dataset)")
     print("=" * 62)
     print(f"Device : {DEVICE}")
     print(f"Config : {N_TRAIN} train / {N_EVAL} held-out | {STEPS} steps | bs={BS}")
+    print(f"Dataset: HotpotQA (Yang et al. 2018) — multi-hop reasoning")
     print()
 
     # Data
-    jsonl_path           = download_musique()
-    train_pairs, eval_pairs = load_musique_pairs(jsonl_path, N_TRAIN, N_EVAL)
+    train_pairs, eval_pairs = load_hotpotqa_pairs(N_TRAIN, N_EVAL)
     print()
 
     # Model
@@ -201,13 +183,13 @@ def main():
     ckpt_dir = Path("/kaggle/working/checkpoints")
     ckpt_dir.mkdir(exist_ok=True)
     trainable = {k: v for k, v in model.state_dict().items() if not k.startswith("bert.")}
-    torch.save(trainable, ckpt_dir / "musique_model.pt")
-    print(f"Checkpoint saved: {ckpt_dir / 'musique_model.pt'}")
+    torch.save(trainable, ckpt_dir / "hotpotqa_model.pt")
+    print(f"Checkpoint saved: {ckpt_dir / 'hotpotqa_model.pt'}")
     print()
 
     # Evaluate held-out
     print("=" * 62)
-    print(f"HELD-OUT EVAL — {len(eval_pairs)} MuSiQue pairs (never seen during training)")
+    print(f"HELD-OUT EVAL — {len(eval_pairs)} HotpotQA pairs (never seen during training)")
     print("=" * 62)
     held_out = evaluate(model, eval_pairs, tok)
     print()
@@ -226,14 +208,14 @@ def main():
     print(f"{'Dataset':<28} {'DELTA_PPL':>10} {'SPECIFICITY':>12} {'Pass?':>6}")
     print("-" * 62)
     print(f"{'Wikipedia (8000tr/1000ev)':<28} {'  +755':>10} {'   +608':>12} {'PASS':>6}")
-    print(f"{'MuSiQue  (5000tr/500ev)':<28} {held_out['delta_ppl']:>+10.0f} "
+    print(f"{'HotpotQA (5000tr/500ev)':<28} {held_out['delta_ppl']:>+10.0f} "
           f"{held_out['specificity']:>+12.0f} {'PASS' if held_out['pass'] else 'FAIL':>6}")
     print()
     if held_out["pass"]:
         print("CONCLUSION: Both datasets PASS.")
         print("The architecture generalizes across dataset types:")
-        print("  - Wikipedia: free-form encyclopedic paragraphs")
-        print("  - MuSiQue  : structured 2-hop reasoning across articles")
+        print("  - Wikipedia: free-form encyclopedic paragraph pairs")
+        print("  - HotpotQA : structured 2-hop reasoning across articles")
         print("No architecture changes. Same hyperparameters. Both generalize.")
     else:
         print("CONCLUSION: MuSiQue FAIL — investigate above.")
