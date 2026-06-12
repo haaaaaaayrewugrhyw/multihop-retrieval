@@ -440,6 +440,46 @@ The LLM approach has two failure modes absent from bert_maxsim: (1) identifying 
 
 ---
 
+### Experiment 10: VitaminC Linear Probe — Does Delta Encode Factual Change Direction?
+
+**Question:** Can a frozen linear classifier, trained on delta = G(A, B) vectors, predict whether the factual change in B SUPPORTS or REFUTES a claim?
+
+**Why this matters:** All prior experiments are intrinsic (reconstruction quality, specificity) or token-localization. Experiment 10 is the first external semantic probe: it tests whether delta encodes the *direction* of factual change, not just that change happened. If a linear probe on delta predicts SUPPORTS vs REFUTES above chance with meaningful selectivity (> 0.10 over shuffled-label control), delta encodes semantic content that generalizes beyond reconstruction utility.
+
+**Dataset:** VitaminC (Schuster et al., NAACL 2021, `tals/vitaminc`) — 488,904 Wikipedia revision pairs. Each pair has a claim + two evidence passages (old and new Wikipedia revision) + a label: SUPPORTS / REFUTES. The two evidence passages differ by a single minimal factual change that flips the label.
+
+**Pair construction:**
+- A = evidence passage that SUPPORTS the claim
+- B = evidence passage that REFUTES the same claim (single-fact difference from A)
+- Also add reverse pairs (A=REFUTES, B=SUPPORTS) for label balance
+- delta = G(A, B) — G is the Wikipedia-trained checkpoint, zero fine-tuning
+
+**Probe:**
+- Input: delta[:, 0] (CLS token of G(A,B) output) — probe sees ONLY delta, not A or B
+- Task: predict SUPPORTS vs REFUTES (binary classification)
+- Model: logistic regression (linear, frozen representation)
+- Selectivity: accuracy_probe − accuracy_control (control = same probe, shuffled labels)
+
+**Baselines:**
+- BERT(B) alone: probe on H_B[:, 0] — what can B's text alone predict?
+- BERT(B) − BERT(A): probe on the embedding difference — simple subtraction baseline
+
+**Results: *(pending Kaggle run — run `run_vitaminc_probe.ipynb`)*
+
+| Method | Acc | F1 | Selectivity |
+|--------|-----|----|-------------|
+| delta_system G(A,B) CLS | TBD | TBD | TBD |
+| BERT(B) alone | TBD | TBD | TBD |
+| BERT(B) − BERT(A) | TBD | TBD | TBD |
+| Chance (binary) | ~0.500 | — | — |
+
+**Interpretation key:**
+- Selectivity > 0.10: delta encodes factual change direction, not reconstruction noise
+- delta > B-alone: delta captures relational information that B's embedding misses
+- delta > chance only: some content, but B's raw text is more informative
+
+---
+
 ## 7. What Was Tried and Abandoned
 
 ### Explicit Per-Position Gate
@@ -475,6 +515,8 @@ Added a gating network `g_gate: Linear(768,384) → GELU → Linear(384,1) → S
 9. **Token-level localization does not emerge from reconstruction loss — but frozen BERT solves it.** With gold insertion labels from IteraTeR (535 pairs), delta norms achieve AUC = 0.505 (random). However, frozen BERT max-cosine similarity (bert_maxsim: `1 − max_j cos(H_B[t], H_A[j])`) achieves AUC = 0.948, F1 = 0.877 with zero training. This is a principled finding: reconstruction loss is sequence-level and cannot propagate position-specific gradients to G. bert_maxsim directly exploits BERT's pretraining objective, which encodes token-level semantic similarity geometrically.
 
 10. **Frozen BERT cosine matches a 70B LLM on insertion localization at zero cost.** Llama-3.3-70B (Groq, zero-shot) achieves F1 = 0.875 on the same IteraTeR pairs. bert_maxsim achieves F1 = 0.877 — a +0.001 gap — with no parameters trained and no API cost. This establishes a natural decomposition: G(A,B) extracts WHAT B adds beyond A globally (reconstruction training required); bert_maxsim identifies WHERE in B the novel content is (no training required). Both operate without labeled novelty data.
+
+11. **VitaminC probe tests whether delta encodes factual change direction.** *(Experiment 10 — results pending.)* A frozen linear probe trained on delta[:, 0] (CLS token of G(A,B)) predicts SUPPORTS vs REFUTES on VitaminC Wikipedia revision contrast pairs. The key test: selectivity (accuracy minus shuffled-label control) > 0.10 = meaningful semantic content. If delta outperforms BERT(B) alone, it captures relational information that B's embedding cannot provide — proof that delta encodes the direction of factual change, not just reconstruction statistics.
 
 ---
 
@@ -521,6 +563,8 @@ delta_system/
 ├── run_newsedits.ipynb        ← Self-contained NewsEdits notebook (4 cells)
 ├── run_wiki_atomic.ipynb      ← Token-level eval notebook (3 cells)
 ├── run_gpt_comparison.ipynb   ← LLM comparison notebook (2 cells)
+├── vitaminc_probe_eval.py     ← Exp 10: VitaminC linear probe (SUPPORTS/REFUTES)
+├── run_vitaminc_probe.ipynb   ← VitaminC probe notebook (3 cells)
 └── SYSTEM.md                  ← Architecture reference (technical, detailed)
 ```
 
