@@ -132,10 +132,12 @@ def load_vitaminc_pairs(n_pairs: int):
         if A == B or len(A) < 30 or len(B) < 30:
             continue
 
-        # Forward: G(supports → refutes), label = REFUTES
-        pairs.append({"A": A, "B": B, "claim": claim, "label": 1})
-        # Reverse: G(refutes → supports), label = SUPPORTS
-        pairs.append({"A": B, "B": A, "claim": claim, "label": 0})
+        # Forward: G(A_sup → B_ref). Delta captures A_sup's factual content
+        # (the supporting fact), so probe sees a SUPPORTS signal → label 0.
+        pairs.append({"A": A, "B": B, "claim": claim, "label": 0})
+        # Reverse: G(A_ref → B_sup). Delta captures A_ref's factual content
+        # (the refuting fact), so probe sees a REFUTES signal → label 1.
+        pairs.append({"A": B, "B": A, "claim": claim, "label": 1})
 
         if len(pairs) >= n_pairs:
             break
@@ -390,7 +392,9 @@ def main():
     if sel > 0.10:
         verdict = "STRONG: delta encodes factual change direction (selectivity > 0.10)"
     elif sel > 0.05:
-        verdict = "MODERATE: delta has real semantic content (selectivity 0.05–0.10)"
+        verdict = "MODERATE: delta has real semantic content (selectivity 0.05-0.10)"
+    elif sel < -0.10:
+        verdict = "INVERTED STRONG: high signal but wrong polarity — check label convention"
     else:
         verdict = "WEAK: delta CLS does not clearly encode SUPPORTS/REFUTES direction"
 
