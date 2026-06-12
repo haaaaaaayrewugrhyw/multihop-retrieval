@@ -57,8 +57,8 @@ def load_wikipedia_pairs(n=1000, skip=10000):
     The Wikipedia training used pairs 0-9000, so skip=10000 ensures no overlap.
     """
     from datasets import load_dataset
-    print(f"Streaming Wikipedia (20220301.en), skipping first {skip} pairs...")
-    ds    = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
+    print(f"Streaming Wikipedia (wikimedia/wikipedia 20231101.en), skipping first {skip} pairs...")
+    ds    = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
     pairs = []
     seen  = 0
 
@@ -266,7 +266,7 @@ def main():
     print(f"  {'(p-value)':<30} {p_delta:>12.2e} {p_tfidf:>12.2e} {'—':>8}")
     print(f"  {'AUC-ROC (median split)':<30} {auc_delta:>12.4f} {auc_tfidf:>12.4f} {'0.500':>8}")
     print()
-    print("  Quartile breakdown (Q1=least novel → Q4=most novel):")
+    print("  Quartile breakdown (Q1=least novel -> Q4=most novel):")
     print(f"  {'Quartile':<12} {'Novelty range':>20} {'mean(delta.norm())':>20} {'n':>6}")
     print(f"  {'-'*60}")
     q_ranges = [(gt.min(), q_bounds[0]),
@@ -279,7 +279,7 @@ def main():
 
     trend_ok = all(q_means[i] <= q_means[i+1] for i in range(3)
                    if not (np.isnan(q_means[i]) or np.isnan(q_means[i+1])))
-    print(f"  Monotone Q1→Q4 : {'YES (delta norms increase with novelty)' if trend_ok else 'NO'}")
+    print(f"  Monotone Q1->Q4 : {'YES (delta norms increase with novelty)' if trend_ok else 'NO'}")
     print()
 
     print("=" * 66)
