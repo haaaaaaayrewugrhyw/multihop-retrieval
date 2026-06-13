@@ -150,22 +150,34 @@ def load_pairs(n: int, tok: BertTokenizerFast):
 
 # ── Per-token perplexity with / without delta ──────────────────────────────────
 
-@torch.no_grad()
-def eval_novel_ppl(model: DeltaSystem, pairs: list,
-                   tok: BertTokenizerFast, batch_size: int = 8):
-    """
-    For each pair, compute per-token cross-entropy with delta and without delta.
-    Split results into novel tokens and shared tokens.
+CONDS = ["full", "none", "no_delta", "no_d0"]
+CATS  = ["novel", "shared"]
 
-    Returns four lists (one float per pair):
-      ppl_novel_with, ppl_novel_no, ppl_shared_with, ppl_shared_no
+
+@torch.no_grad()
+def eval_conditions(model: DeltaSystem, pairs: list,
+                    tok: BertTokenizerFast, batch_size: int = 8):
+    """
+    For each pair, compute per-token cross-entropy under FOUR ablation conditions,
+    split into novel vs shared tokens:
+
+      full     : delta ON,  delta_0 ON   (the real system)
+      none     : delta OFF, delta_0 OFF  (original Exp-11 ablation)
+      no_delta : delta OFF, delta_0 ON   (isolate token-delta contribution)
+      no_d0    : delta ON,  delta_0 OFF  (isolate delta_0 contribution)
+
+    Returns:
+      pair_ce  : {cat: {cond: [per-pair mean CE in nats]}}   -- macro stats / median / t-test
+      pool_sum : {cat: {cond: sum of token CE}}              -- micro (pooled) mean
+      pool_cnt : {cat: total token count}
+    Per-pair lists are index-aligned across conditions and categories (same pair order),
+    so paired tests between conditions/categories are valid.
     """
     model.eval()
 
-    ppl_novel_with  = []
-    ppl_novel_no    = []
-    ppl_shared_with = []
-    ppl_shared_no   = []
+    pair_ce  = {c: {cond: [] for cond in CONDS} for c in CATS}
+    pool_sum = {c: {cond: 0.0 for cond in CONDS} for c in CATS}
+    pool_cnt = {c: 0 for c in CATS}
 
     for i in range(0, len(pairs), batch_size):
         batch = pairs[i:i + batch_size]
@@ -180,55 +192,53 @@ def eval_novel_ppl(model: DeltaSystem, pairs: list,
         B_ids  = eB["input_ids"].to(DEVICE)
         B_mask = eB["attention_mask"].to(DEVICE)
 
-        # Forward with delta
-        logits_with, _, _, _, _ = model(A_ids, A_mask, B_ids, B_mask,
-                                        ablate_delta=False)
-        # Forward without delta (ablation: zeros all delta info)
-        logits_no, _, _, _, _ = model(A_ids, A_mask, B_ids, B_mask,
-                                      ablate_delta=True)
+        # Encode + generate delta ONCE, then reconstruct under each condition
+        H_A = model._enc(A_ids, A_mask)
+        H_B = model._enc(B_ids, B_mask)
+        delta, delta_0, _ = model.generate_delta(H_A, A_mask, H_B, B_mask)
 
-        # Per-token CE: shape [b, T]
-        b, T, V = logits_with.shape
-        targets = B_ids  # teacher-forced targets
+        logits = {
+            "full":     model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask),
+            "none":     model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, ablate_delta=True),
+            "no_delta": model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, drop_delta=True),
+            "no_d0":    model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, drop_d0=True),
+        }
 
-        ce_with = F.cross_entropy(
-            logits_with.view(-1, V), targets.view(-1),
-            reduction="none").view(b, T)
-        ce_no = F.cross_entropy(
-            logits_no.view(-1, V), targets.view(-1),
-            reduction="none").view(b, T)
-
-        ce_with = ce_with.cpu().numpy()
-        ce_no   = ce_no.cpu().numpy()
-        b_mask  = B_mask.cpu().numpy()
+        b, T, V = logits["full"].shape
+        ce = {}
+        for cond in CONDS:
+            ce[cond] = F.cross_entropy(
+                logits[cond].view(-1, V), B_ids.view(-1),
+                reduction="none").view(b, T).cpu().numpy()
+        b_mask = B_mask.cpu().numpy()
 
         for j, p in enumerate(batch):
             rl       = min(p["real_len"], T)
-            nov_mask = p["novel_mask"][:rl]       # 1 = novel, 0 = shared
-            tok_mask = b_mask[j, :rl].astype(bool) # 1 = real token
-            # Exclude CLS (position 0) and SEP (last real position)
-            if rl > 2:
+            nov_mask = p["novel_mask"][:rl]        # 1 = novel, 0 = shared
+            tok_mask = b_mask[j, :rl].astype(bool)  # 1 = real token
+            if rl > 2:                               # exclude CLS + final SEP
                 tok_mask[0] = False
                 tok_mask[rl - 1] = False
 
-            novel_idx  = (nov_mask == 1) & tok_mask
-            shared_idx = (nov_mask == 0) & tok_mask
-
-            if novel_idx.sum() == 0 or shared_idx.sum() == 0:
+            idx = {"novel": (nov_mask == 1) & tok_mask,
+                   "shared": (nov_mask == 0) & tok_mask}
+            if idx["novel"].sum() == 0 or idx["shared"].sum() == 0:
                 continue
 
-            # Mean CE → PPL per category per pair
-            ppl_novel_with.append(float(np.exp(np.minimum(ce_with[j, :rl][novel_idx].mean(), 20))))
-            ppl_novel_no.append(  float(np.exp(np.minimum(ce_no[j,   :rl][novel_idx].mean(), 20))))
-            ppl_shared_with.append(float(np.exp(np.minimum(ce_with[j, :rl][shared_idx].mean(), 20))))
-            ppl_shared_no.append(  float(np.exp(np.minimum(ce_no[j,   :rl][shared_idx].mean(), 20))))
+            for c in CATS:
+                m = idx[c]
+                pool_cnt[c] += int(m.sum())
+                for cond in CONDS:
+                    vals = ce[cond][j, :rl][m]
+                    pair_ce[c][cond].append(float(vals.mean()))   # nats, no exp
+                    pool_sum[c][cond] += float(vals.sum())
 
         if (i // batch_size) % 10 == 0:
             done = min(i + batch_size, len(pairs))
             print(f"  Evaluating: {done}/{len(pairs)}  "
-                  f"(novel pairs so far: {len(ppl_novel_with)})")
+                  f"(valid pairs so far: {len(pair_ce['novel']['full'])})")
 
-    return ppl_novel_with, ppl_novel_no, ppl_shared_with, ppl_shared_no
+    return pair_ce, pool_sum, pool_cnt
 
 
 # ── Checkpoint finder ─────────────────────────────────────────────────────────
@@ -288,103 +298,95 @@ def main():
         print(f"WARNING: no checkpoint at {ckpt} — using random weights")
     print()
 
-    # ── Evaluate ───────────────────────────────────────────────────────────────
-    print("Running D_recon with delta (G(A,B)) and without delta (ablation)...")
+    # ── Evaluate (4 ablation conditions) ────────────────────────────────────────
+    print("Running 4 conditions: full | none | no_delta | no_d0 ...")
     print("Splitting results into novel tokens vs shared tokens...")
     print()
 
-    ppl_nov_w, ppl_nov_no, ppl_sh_w, ppl_sh_no = eval_novel_ppl(model, pairs, tok)
+    pair_ce, pool_sum, pool_cnt = eval_conditions(model, pairs, tok)
 
-    n = len(ppl_nov_w)
+    n = len(pair_ce["novel"]["full"])
     print(f"\n  Valid pairs: {n}")
+    if n < 5:
+        print("ERROR: too few valid pairs to report stats.")
+        sys.exit(1)
     print()
 
-    # ── Compute DELTA_PPL per category ─────────────────────────────────────────
-    arr_nw  = np.array(ppl_nov_w)
-    arr_nno = np.array(ppl_nov_no)
-    arr_sw  = np.array(ppl_sh_w)
-    arr_sno = np.array(ppl_sh_no)
+    # Per-pair CE arrays (nats), index-aligned across conditions/categories
+    pc = {c: {cond: np.array(pair_ce[c][cond]) for cond in CONDS} for c in CATS}
+    # Micro (token-pooled) mean CE — robust, not outlier-inflated
+    micro = {c: {cond: pool_sum[c][cond] / max(pool_cnt[c], 1) for cond in CONDS}
+             for c in CATS}
 
-    novel_delta  = arr_nno  - arr_nw    # positive = delta helps novel tokens
-    shared_delta = arr_sno  - arr_sw    # positive = delta helps shared tokens
+    def _report_delta(name, base_cond, vs_cond, cat):
+        """ΔCE = CE(vs_cond) - CE(base_cond): positive = base_cond is BETTER
+        (lower CE), i.e. the removed component HELPS this category."""
+        per_pair = pc[cat][vs_cond] - pc[cat][base_cond]    # per-pair ΔCE
+        micro_d  = micro[cat][vs_cond] - micro[cat][base_cond]
+        mean_d   = float(per_pair.mean())
+        med_d    = float(np.median(per_pair))
+        t, p     = stats.ttest_1samp(per_pair, 0.0)
+        print(f"  {name:<46} ΔCE(micro)={micro_d:+7.4f}  "
+              f"mean={mean_d:+7.4f}  median={med_d:+7.4f}  t={t:+6.2f} p={p:.4g}")
+        return {"micro": micro_d, "mean": mean_d, "median": med_d, "p": float(p)}
 
-    mean_novel  = float(novel_delta.mean())
-    mean_shared = float(shared_delta.mean())
-    ratio       = mean_novel / max(abs(mean_shared), 1e-6)
-
-    # Paired t-test: is the novel improvement significantly larger than shared?
-    diff = novel_delta - shared_delta
-    t_stat, p_val = stats.ttest_1samp(diff, 0.0)
-
-    print("=" * 70)
-    print("RESULTS — Novel-only DELTA_PPL  (Experiment 11)")
-    print("=" * 70)
+    print("=" * 78)
+    print("RESULTS — CE-space (nats). Positive ΔCE = the removed signal HELPS.")
+    print("Primary signal = micro ΔCE + median + p-value. (PPL shown for continuity only.)")
+    print("=" * 78)
     print()
-    print(f"  {'Category':<30} {'PPL with δ':>12} {'PPL no δ':>12} {'DELTA_PPL':>12}")
-    print("  " + "-" * 68)
-    print(f"  {'Novel tokens (inserted)':<30} "
-          f"{arr_nw.mean():>12.2f} {arr_nno.mean():>12.2f} {mean_novel:>+12.2f}")
-    print(f"  {'Shared tokens (from A)':<30} "
-          f"{arr_sw.mean():>12.2f} {arr_sno.mean():>12.2f} {mean_shared:>+12.2f}")
+    print("  Micro mean CE per condition (lower = better reconstruction):")
+    print(f"  {'':<10}{'full':>10}{'none':>10}{'no_delta':>10}{'no_d0':>10}")
+    for c in CATS:
+        print(f"  {c:<10}" + "".join(f"{micro[c][cond]:>10.4f}" for cond in CONDS))
     print()
-    print(f"  Novel / Shared DELTA_PPL ratio : {ratio:.2f}x")
-    print(f"  Paired t-test (novel > shared) : t={t_stat:.3f}, p={p_val:.4f}")
-    print()
-
-    # ── Interpretation ─────────────────────────────────────────────────────────
-    print("=" * 70)
-    print("INTERPRETATION")
-    print("=" * 70)
+    print("  Equivalent PPL = exp(micro CE):")
+    for c in CATS:
+        print(f"  {c:<10}" + "".join(f"{np.exp(min(micro[c][cond],30)):>10.1f}" for cond in CONDS))
     print()
 
-    if mean_novel > 0 and mean_novel > mean_shared * 1.5 and p_val < 0.05:
-        verdict = "STRONG PROOF"
-        detail  = (f"Novel DELTA_PPL ({mean_novel:+.1f}) >> "
-                   f"Shared DELTA_PPL ({mean_shared:+.1f}) by {ratio:.1f}x, p={p_val:.4f}.\n"
-                   f"  Delta specifically reduces perplexity on INSERTED tokens.\n"
-                   f"  Delta encodes what B adds beyond A. PROVEN.")
-    elif mean_novel > 0 and mean_novel > mean_shared and p_val < 0.10:
-        verdict = "MODERATE PROOF"
-        detail  = (f"Novel DELTA_PPL ({mean_novel:+.1f}) > "
-                   f"Shared DELTA_PPL ({mean_shared:+.1f}), p={p_val:.4f}.\n"
-                   f"  Delta helps novel tokens more than shared. Trend is real but modest.")
-    elif mean_novel > 0 and mean_shared > 0 and ratio < 1.2:
-        verdict = "INCONCLUSIVE"
-        detail  = (f"Novel DELTA_PPL ({mean_novel:+.1f}) ≈ "
-                   f"Shared DELTA_PPL ({mean_shared:+.1f}) (ratio {ratio:.2f}x).\n"
-                   f"  Delta helps reconstruction generally, not specifically novel tokens.\n"
-                   f"  Does NOT prove delta specifically encodes what B adds.")
+    # ── Full delta-info effect (none - full): the headline question ──────────────
+    print("-" * 78)
+    print("  [1] FULL delta-info effect  (none - full): does delta+delta_0 help?")
+    nov_full = _report_delta("novel:  delta+delta_0 effect",  "full", "none", "novel")
+    sh_full  = _report_delta("shared: delta+delta_0 effect",  "full", "none", "shared")
+    print()
+
+    # ── 3-way attribution on NOVEL tokens ────────────────────────────────────────
+    print("-" * 78)
+    print("  [2] Attribution on NOVEL tokens — which component helps/hurts?")
+    nov_tokdelta = _report_delta("novel:  token-delta only  (no_delta - full)",
+                                 "full", "no_delta", "novel")
+    nov_d0       = _report_delta("novel:  delta_0 only      (no_d0 - full)",
+                                 "full", "no_d0", "novel")
+    print()
+
+    # ── Paired novel-vs-shared (full effect), CE-space ───────────────────────────
+    diff = (pc["novel"]["none"] - pc["novel"]["full"]) - \
+           (pc["shared"]["none"] - pc["shared"]["full"])
+    t_ns, p_ns = stats.ttest_1samp(diff, 0.0)
+    print(f"  [3] Paired novel-vs-shared full effect: "
+          f"mean Δ={float(diff.mean()):+.4f}  t={t_ns:+.2f}  p={p_ns:.4g}")
+    print()
+
+    # ── Verdict (based on robust CE-space novel effect) ──────────────────────────
+    print("=" * 78)
+    print("VERDICT  (based on micro ΔCE on NOVEL tokens + significance)")
+    print("=" * 78)
+    m, p = nov_full["micro"], nov_full["p"]
+    if m > 0.02 and p < 0.05:
+        v = "POSITIVE — delta-info significantly HELPS novel-token prediction."
+    elif m < -0.02 and p < 0.05:
+        v = "NEGATIVE — delta-info significantly HURTS novel-token prediction (collapse)."
     else:
-        verdict = "NEGATIVE"
-        detail  = (f"Novel DELTA_PPL ({mean_novel:+.1f}), "
-                   f"Shared DELTA_PPL ({mean_shared:+.1f}).\n"
-                   f"  Delta does not preferentially help novel tokens.\n"
-                   f"  Delta encodes general reconstruction signal, not specific novelty.")
-
-    print(f"  Verdict: {verdict}")
-    print(f"  {detail}")
-    print()
-
-    # ── Paper headline ─────────────────────────────────────────────────────────
-    print("=" * 70)
-    print("PAPER HEADLINE (Experiment 11 — Insertion Cloze):")
-    print("=" * 70)
-    print(f"  Novel  DELTA_PPL (inserted tokens) : {mean_novel:+.2f}")
-    print(f"  Shared DELTA_PPL (copied tokens)   : {mean_shared:+.2f}")
-    print(f"  Ratio                               : {ratio:.2f}x")
-    print(f"  p-value (novel > shared)            : {p_val:.4f}")
-    print()
-    print("  Full experiment table:")
-    print(f"  {'Dataset':<35} {'Metric':<20} {'Value':>8}")
-    print("  " + "-" * 65)
-    print(f"  {'Wikipedia (same domain)':<35} {'DELTA_PPL':>20} {'  +755':>8}")
-    print(f"  {'HotpotQA (cross-dataset)':<35} {'DELTA_PPL':>20} {'  +480':>8}")
-    print(f"  {'NewsEdits (cross-domain)':<35} {'DELTA_PPL':>20} {' +1295':>8}")
-    print(f"  {'IteraTeR bert_maxsim':<35} {'Token AUC':>20} {'0.948':>8}")
-    print(f"  {'VitaminC probe':<35} {'Acc (corrected)':>20} {'~0.797':>8}")
-    print(f"  {'IteraTeR novel tokens':<35} {'Novel DELTA_PPL':>20} {mean_novel:>+8.2f}")
-    print(f"  {'IteraTeR shared tokens':<35} {'Shared DELTA_PPL':>20} {mean_shared:>+8.2f}")
-    print("=" * 70)
+        v = "NEUTRAL — no significant delta effect on novel tokens."
+    print(f"  {v}")
+    print(f"  novel full-effect micro ΔCE = {m:+.4f} (p={p:.4g});  "
+          f"shared = {sh_full['micro']:+.4f}")
+    print(f"  Attribution: token-delta ΔCE={nov_tokdelta['micro']:+.4f} (p={nov_tokdelta['p']:.3g}) | "
+          f"delta_0 ΔCE={nov_d0['micro']:+.4f} (p={nov_d0['p']:.3g})")
+    print("  → the component with the more NEGATIVE ΔCE is the one dragging novel tokens down.")
+    print("=" * 78)
 
 
 if __name__ == "__main__":

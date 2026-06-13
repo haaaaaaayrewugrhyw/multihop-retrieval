@@ -129,7 +129,14 @@ class DeltaSystem(nn.Module):
 
     # ── Reconstructor ─────────────────────────────────────────────────────────
     def reconstruct(self, H_A, A_mask, delta, delta_0, B_ids, B_mask,
-                    ablate_delta: bool = False):
+                    ablate_delta: bool = False,
+                    drop_delta: bool = False, drop_d0: bool = False):
+        # Ablation flags (for 3-way attribution in eval):
+        #   ablate_delta : zero ALL delta info (token-delta + delta_0) -- ORIGINAL behavior, unchanged
+        #   drop_delta   : zero ONLY the token-level delta (keep delta_0)
+        #   drop_d0      : zero ONLY delta_0            (keep token-level delta)
+        # The two fine-grained flags let us isolate whether delta or delta_0 causes
+        # the Novel DELTA_PPL harm, without changing ablate_delta semantics.
         b, T = B_ids.shape
         dev  = B_ids.device
 
@@ -139,18 +146,27 @@ class DeltaSystem(nn.Module):
             H_A    = H_A * keep.view(b, 1, 1)
             A_mask = (A_mask.float() * keep.view(b, 1)).long()
 
+        d0_mask = torch.ones(b, 1, dtype=torch.long, device=dev)
+
         # Delta pathway (or zero everything for ablation)
         if ablate_delta:
+            # ORIGINAL behavior: zero all delta info (d0_mask stays 1)
             d0_tok     = torch.zeros(b, 1, D_MODEL, device=dev)
             delta_enc  = torch.zeros(b, T, D_MODEL, device=dev)
             delta_mask = torch.zeros(b, T, dtype=torch.long, device=dev)
         else:
-            d0_tok     = self.dr_d0(delta_0).unsqueeze(1)
-            delta_enc  = self.dr_delta_enc(delta, src_key_padding_mask=~B_mask.bool())
-            delta_mask = B_mask
+            # token-level delta pathway
+            if drop_delta:
+                delta_enc  = torch.zeros(b, T, D_MODEL, device=dev)
+                delta_mask = torch.zeros(b, T, dtype=torch.long, device=dev)
+            else:
+                delta_enc  = self.dr_delta_enc(delta, src_key_padding_mask=~B_mask.bool())
+                delta_mask = B_mask
+            # delta_0 pathway
+            d0_tok = torch.zeros(b, 1, D_MODEL, device=dev) if drop_d0 \
+                     else self.dr_d0(delta_0).unsqueeze(1)
 
         # Build memory: [delta_0_token | H_A | enc(delta)]
-        d0_mask = torch.ones(b, 1, dtype=torch.long, device=dev)
         memory  = torch.cat([d0_tok,  H_A,    delta_enc ], dim=1)
         mem_pad = ~torch.cat([d0_mask, A_mask, delta_mask], dim=1).bool()
 
