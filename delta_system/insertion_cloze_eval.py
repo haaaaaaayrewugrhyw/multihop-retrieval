@@ -150,7 +150,7 @@ def load_pairs(n: int, tok: BertTokenizerFast):
 
 # ── Per-token perplexity with / without delta ──────────────────────────────────
 
-CONDS = ["full", "none", "no_delta", "no_d0"]
+CONDS = ["full", "none", "no_delta", "no_d0", "shuf", "noA"]
 CATS  = ["novel", "shared"]
 
 
@@ -165,6 +165,11 @@ def eval_conditions(model: DeltaSystem, pairs: list,
       none     : delta OFF, delta_0 OFF  (original Exp-11 ablation)
       no_delta : delta OFF, delta_0 ON   (isolate token-delta contribution)
       no_d0    : delta ON,  delta_0 OFF  (isolate delta_0 contribution)
+      shuf     : delta from a DIFFERENT pair (circular shift) -- pair-specificity control
+      noA      : delta computed with the generator BLIND to A (H_A zeroed), but
+                 reconstruction still uses the real A -- tests whether the "beyond A"
+                 conditioning is what makes delta useful, vs delta just encoding B.
+                 (Off-distribution: G was never trained with H_A=0 -- interpret directionally.)
 
     Returns:
       pair_ce  : {cat: {cond: [per-pair mean CE in nats]}}   -- macro stats / median / t-test
@@ -197,11 +202,25 @@ def eval_conditions(model: DeltaSystem, pairs: list,
         H_B = model._enc(B_ids, B_mask)
         delta, delta_0, _ = model.generate_delta(H_A, A_mask, H_B, B_mask)
 
+        # Control 1 — shuffled delta (circular shift within batch): wrong pair's delta
+        if b > 1:
+            sidx = list(range(1, b)) + [0]
+            delta_shuf, delta0_shuf = delta[sidx], delta_0[sidx]
+        else:
+            delta_shuf, delta0_shuf = delta, delta_0
+
+        # Control 2 — generator blind to A: zero H_A only for delta generation
+        # (reconstruction below still gets the REAL H_A)
+        H_A_zero = torch.zeros_like(H_A)
+        delta_noA, delta0_noA, _ = model.generate_delta(H_A_zero, A_mask, H_B, B_mask)
+
         logits = {
             "full":     model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask),
             "none":     model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, ablate_delta=True),
             "no_delta": model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, drop_delta=True),
             "no_d0":    model.reconstruct(H_A, A_mask, delta, delta_0, B_ids, B_mask, drop_d0=True),
+            "shuf":     model.reconstruct(H_A, A_mask, delta_shuf, delta0_shuf, B_ids, B_mask),
+            "noA":      model.reconstruct(H_A, A_mask, delta_noA,  delta0_noA,  B_ids, B_mask),
         }
 
         b, T, V = logits["full"].shape
@@ -369,9 +388,26 @@ def main():
           f"mean Δ={float(diff.mean()):+.4f}  t={t_ns:+.2f}  p={p_ns:.4g}")
     print()
 
+    # ── [4] Controls: is delta pair-specific, and does it need A? ─────────────────
+    print("-" * 78)
+    print("  [4] CONTROLS on NOVEL tokens — positive ΔCE = the control is WORSE than full")
+    nov_shuf = _report_delta("novel:  shuffled-delta penalty  (shuf - full)",
+                             "full", "shuf", "novel")
+    nov_noA  = _report_delta("novel:  no-A-in-generator penalty (noA - full)",
+                             "full", "noA", "novel")
+    full_benefit = micro["novel"]["none"] - micro["novel"]["full"]   # CE recovered by full delta
+    spec_frac = nov_shuf["micro"] / full_benefit if full_benefit > 1e-6 else float("nan")
+    Adep_frac = nov_noA["micro"]  / full_benefit if full_benefit > 1e-6 else float("nan")
+    print(f"  full-delta benefit on novel (none-full) = {full_benefit:+.4f} nats")
+    print(f"  pair-specific fraction  (shuf penalty / benefit) = {spec_frac:6.1%}  "
+          f"(100% = wrong-pair delta is useless -> fully pair-specific)")
+    print(f"  A-dependence fraction   (noA  penalty / benefit) = {Adep_frac:6.1%}  "
+          f"(100% = delta needs A -> captures B-beyond-A;  ~0% = delta is just B)")
+    print()
+
     # ── Verdict (based on robust CE-space novel effect) ──────────────────────────
     print("=" * 78)
-    print("VERDICT  (based on micro ΔCE on NOVEL tokens + significance)")
+    print("VERDICT  (based on micro ΔCE on NOVEL tokens + significance + controls)")
     print("=" * 78)
     m, p = nov_full["micro"], nov_full["p"]
     if m > 0.02 and p < 0.05:
@@ -385,7 +421,12 @@ def main():
           f"shared = {sh_full['micro']:+.4f}")
     print(f"  Attribution: token-delta ΔCE={nov_tokdelta['micro']:+.4f} (p={nov_tokdelta['p']:.3g}) | "
           f"delta_0 ΔCE={nov_d0['micro']:+.4f} (p={nov_d0['p']:.3g})")
-    print("  → the component with the more NEGATIVE ΔCE is the one dragging novel tokens down.")
+    print(f"  Controls: pair-specific={spec_frac:.0%} (shuf p={nov_shuf['p']:.3g}) | "
+          f"A-dependence={Adep_frac:.0%} (noA p={nov_noA['p']:.3g})")
+    print()
+    print("  READS:")
+    print("   - pair-specific HIGH  -> delta's novel help is tied to THIS pair (not generic).")
+    print("   - A-dependence  HIGH  -> delta captures B-BEYOND-A (needs A); LOW -> delta is just B.")
     print("=" * 78)
 
 
