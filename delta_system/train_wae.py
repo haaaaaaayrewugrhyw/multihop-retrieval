@@ -2,22 +2,24 @@
 train_wae.py -- DATASET experiment: train the BASELINE G on SCATTERED edits.
 
 The only change vs the baseline run is the TRAINING DATA:
-  baseline  : Wikipedia consecutive sentences, B = A + " " + next   (APPEND-ONLY)
-  this      : WikiAtomicEdits, A = base_sentence, B = edited_sentence (insertion is
-              SCATTERED inside the sentence, not appended)
+  baseline : Wikipedia consecutive sentences, B = A + " " + next  (APPEND-ONLY)
+  this     : sentence-level revision pairs where the edit is SCATTERED inside the
+             sentence (not appended): A = before, B = after.
 
 Hypothesis: append-only training lets the decoder reconstruct novel tokens from
-left-context ("just continue A") so delta is never forced to carry novelty. Scattered
-edits remove that shortcut naturally (mid-sentence insertions have weak left-context),
-forcing delta to be the source of novel content -> delta should SPECIALIZE.
+left-context ("just continue A"), so delta is never forced to carry novelty. Scattered
+mid-sentence edits remove that shortcut naturally, forcing delta to be the source of
+novel content -> delta should SPECIALIZE (help NOVEL >> SHARED).
 
-PURE: no novelty labels, no oracle, no architecture/objective change. Same model, same
-losses, same hyperparameters as baseline. Only the data differs. Preserves the original
-idea + claim.
+PURE: no novelty labels in the objective, no oracle, no architecture/objective change.
+Same model, same losses, same hyperparameters as baseline. Only the data differs.
+
+Source: WikiAtomicEdits is script-based and no longer loadable, so we use IteraTeR_full_sent
+(large, sentence-level, scattered) with ParaRev as fallback. To avoid leakage with the
+IteraTeR_human_sent EVAL set, we EXCLUDE the exact eval pairs from training (dedup via the
+eval's own loader).
 
 Saves to wiki_model_wae.pt (baseline wiki_model.pt untouched).
-Success: insertion_cloze_eval.py --ckpt wiki_model_wae.pt -> specialization gap
-(novel vs shared full-effect; baseline = -0.14) flips toward/positive.
 
 Run:
     python train_wae.py --steps 2000
@@ -37,60 +39,80 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from model  import DeltaSystem
 from losses import recon_loss, sparsity_loss, specificity_loss
+from insertion_cloze_eval import load_pairs as load_eval_pairs   # for leakage dedup
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LEN = 128
 
-
-def _stream_wae():
-    """Robustly open WikiAtomicEdits English insertions (several load strategies)."""
-    configs = [
-        ("google-research-datasets/wiki_atomic_edits", "english_insertions"),
-        ("google-research-datasets/wiki_atomic_edits", None),
-    ]
-    for repo, cfg in configs:
-        for trust in (True, False):
-            kwargs = dict(split="train", streaming=True)
-            if cfg:
-                kwargs["name"] = cfg
-            if trust:
-                kwargs["trust_remote_code"] = True
-            try:
-                ds = load_dataset(repo, **kwargs)
-                print(f"  opened {repo} cfg={cfg} trust={trust}")
-                return ds
-            except Exception as e:
-                print(f"  attempt failed ({repo}, cfg={cfg}, trust={trust}): {type(e).__name__}")
-    raise RuntimeError(
-        "WikiAtomicEdits could not be loaded. Do NOT fall back to IteraTeR "
-        "(that is the eval set -> leakage). Report this and we'll pick a disjoint "
-        "scattered source.")
+# Scattered-edit sources (standard parquet — no loading script). Tried in order.
+SOURCES = [
+    "wanyu/IteraTeR_full_sent",
+    "taln-ls2n/pararev",
+]
+# Candidate (before, after) column name pairs for auto-detection.
+COL_PAIRS = [
+    ("before_sent", "after_sent"), ("before", "after"),
+    ("source", "target"), ("src", "tgt"), ("old", "new"),
+    ("original", "revised"), ("previous_text", "new_text"),
+    ("text_before", "text_after"), ("old_text", "new_text"),
+]
 
 
-def load_wae_pairs(n_train, min_insert=3, max_insert_ratio=0.5):
-    ds = _stream_wae()
-    pairs, checked = [], 0
+def _detect_cols(ex: dict):
+    for a, b in COL_PAIRS:
+        if a in ex and b in ex and isinstance(ex[a], str) and isinstance(ex[b], str):
+            return a, b
+    return None, None
+
+
+def _open_source():
+    last_keys = None
+    for repo in SOURCES:
+        try:
+            ds    = load_dataset(repo, split="train", streaming=True)
+            first = next(iter(ds))
+            a, b  = _detect_cols(first)
+            if a:
+                print(f"  using {repo}  cols=({a}, {b})")
+                ds = load_dataset(repo, split="train", streaming=True)  # reopen
+                return repo, ds, a, b
+            last_keys = list(first.keys())
+            print(f"  {repo}: no before/after cols; keys={last_keys}")
+        except Exception as e:
+            print(f"  {repo} failed: {type(e).__name__}: {e}")
+    raise RuntimeError(f"No scattered source loaded. Last keys seen: {last_keys}")
+
+
+def load_scattered_pairs(n_train, exclude: set):
+    repo, ds, ca, cb = _open_source()
+    pairs, checked, skipped_leak = [], 0, 0
     for ex in ds:
         checked += 1
-        base   = (ex.get("base_sentence")   or "").strip()
-        edited = (ex.get("edited_sentence") or "").strip()
-        if len(base) < 20 or len(edited) < 20:
+        A = (ex.get(ca) or "").strip()
+        B = (ex.get(cb) or "").strip()
+        if len(A) < 20 or len(B) < 20 or len(A) > 1500 or len(B) > 1500:
             continue
-        if len(edited) <= len(base):
+        if A == B:
             continue
-        insert_len = len(edited) - len(base)
-        if insert_len < min_insert:
+        # meaning-changed only, if the dataset carries labels (matches the eval)
+        labels = ex.get("labels")
+        if labels is not None:
+            labs = labels if isinstance(labels, list) else [labels]
+            if not any("meaning" in str(l).lower() for l in labs):
+                continue
+        if B in exclude or A in exclude:        # leakage guard vs eval set
+            skipped_leak += 1
             continue
-        if insert_len / max(len(edited), 1) > max_insert_ratio:
-            continue
-        pairs.append({"A": base, "B": edited})
+        pairs.append({"A": A, "B": B})
         if len(pairs) >= n_train:
             break
         if checked % 20000 == 0:
-            print(f"  checked {checked:,} | collected {len(pairs)}/{n_train}")
-    print(f"Loaded {len(pairs)} scattered-edit pairs from {checked:,} examples")
+            print(f"  checked {checked:,} | collected {len(pairs)}/{n_train} "
+                  f"| leak-skipped {skipped_leak}")
+    print(f"Loaded {len(pairs)} scattered pairs from {repo} "
+          f"({checked:,} examples scanned, {skipped_leak} eval-overlap skipped)")
     if len(pairs) < n_train * 0.5:
-        raise RuntimeError(f"Only {len(pairs)} pairs — WikiAtomicEdits stream too short.")
+        raise RuntimeError(f"Only {len(pairs)} pairs — source too short / over-filtered.")
     return pairs
 
 
@@ -122,12 +144,20 @@ def main():
     ap.add_argument("--out", default="/kaggle/working/checkpoints/wiki_model_wae.pt")
     args = ap.parse_args()
 
-    print(f"Device: {DEVICE} | steps={args.steps} | SOURCE = WikiAtomicEdits (scattered)")
+    print(f"Device: {DEVICE} | steps={args.steps} | SOURCE = scattered edits")
     print("Baseline architecture + losses; ONLY the training data differs.")
-    pairs = load_wae_pairs(args.n_train)
 
-    tok   = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    model = DeltaSystem().to(DEVICE)                      # baseline: vib=False, no ortho
+    tok = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+    # Build leakage-exclusion set = exact eval pairs (load a buffer > the 500 used)
+    print("Loading eval pairs to build leakage-exclusion set...")
+    eval_pairs = load_eval_pairs(700, tok)
+    exclude = {p["B"].strip() for p in eval_pairs} | {p["A"].strip() for p in eval_pairs}
+    print(f"Excluding {len(exclude)} eval texts from training.")
+
+    pairs = load_scattered_pairs(args.n_train, exclude)
+
+    model = DeltaSystem().to(DEVICE)                       # baseline: vib=False, no ortho
     dl    = DataLoader(PairDS(pairs), batch_size=args.bs, shuffle=True,
                        collate_fn=make_col(tok), num_workers=2, pin_memory=True)
     opt   = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
