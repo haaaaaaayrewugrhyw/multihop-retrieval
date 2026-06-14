@@ -22,6 +22,7 @@ Run: python delta2_data.py --n_edit 600 --n_para 600
 """
 
 import argparse
+import gc
 import pickle
 import re
 import sys
@@ -84,6 +85,13 @@ def lex_overlap(a: str, b: str) -> float:
 
 
 # ── disk cache (VitaminC's 20k streaming scan is the per-run bottleneck) ─────────
+def _gpu_gc():
+    """Reclaim GPU memory (call after `del model`) before the next big load."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _cache_dir():
     base = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(tempfile.gettempdir())
     d = base / "delta2_cache"; d.mkdir(parents=True, exist_ok=True)
@@ -117,9 +125,12 @@ def load_validated_paraphrases(n_cand, nli=None, ent_thr=0.6, max_overlap=0.85, 
     if cache and fp.exists():
         print(f"  [cache] paraphrases <- {fp}")
         return pickle.load(open(fp, "rb"))
-    if nli is None:
+    created = nli is None
+    if created:
         nli = NLI()
     valid, _ = validate_paraphrases(load_paraphrases(n_cand), nli, ent_thr, max_overlap)
+    if created:
+        del nli; _gpu_gc()                          # release roberta-large BEFORE bert loads
     if cache:
         pickle.dump(valid, open(fp, "wb"))
     return valid
@@ -133,10 +144,13 @@ def load_edit_nli_labels(n, edits, nli=None, cache=True):
         print(f"  [cache] nli labels <- {fp}")
         labels = pickle.load(open(fp, "rb"))
     else:
-        if nli is None:
+        created = nli is None
+        if created:
             nli = NLI()
         nli_label_edits(edits, nli)
         labels = [e["nli"] for e in edits]
+        if created:
+            del nli; _gpu_gc()                      # release roberta-large BEFORE bert loads
         if cache:
             pickle.dump(labels, open(fp, "wb"))
     for e, l in zip(edits, labels):
