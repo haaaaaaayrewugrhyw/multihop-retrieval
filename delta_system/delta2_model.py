@@ -22,8 +22,22 @@ Run: python delta2_model.py --aux paraphrase --steps 400
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# Avoid unauthenticated HF-Hub rate-limit stalls on model downloads: pull a token from the
+# Kaggle secret 'HF_TOKEN' if one isn't already set. Safe no-op off Kaggle / if absent.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+if not os.environ.get("HF_TOKEN"):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        _t = UserSecretsClient().get_secret("HF_TOKEN")
+        os.environ["HF_TOKEN"] = _t
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = _t
+        print("HF token: loaded from Kaggle secret")
+    except Exception:
+        print("HF token: none (downloads use unauthenticated rate limits)")
 
 import numpy as np
 import torch
@@ -157,6 +171,7 @@ def main():
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
 
+    print("Building model (loading bert-base-uncased)...", flush=True)
     model = Delta2(args.aux).to(DEVICE).train()
     opt = torch.optim.Adam(model.trainable_parameters(), lr=args.lr)
     rng = np.random.default_rng(0)
