@@ -33,7 +33,7 @@ from transformers import BertTokenizerFast
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from model       import DeltaSystem, D_MODEL
-from delta2_data import (load_edits, load_paraphrases, validate_paraphrases,
+from delta2_data import (load_edits, load_validated_paraphrases,
                          nli_label_edits, NLI, NLI_LABELS)
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
@@ -137,8 +137,7 @@ def main():
     paras, labels = None, None
     nli = NLI()
     if args.aux == "paraphrase":
-        cand = load_paraphrases(1200)
-        paras, st = validate_paraphrases(cand, nli)
+        paras = load_validated_paraphrases(1200, nli)
         print(f"  edits {len(edits)} | validated paraphrases {len(paras)}")
     else:
         nli_label_edits(edits, nli)

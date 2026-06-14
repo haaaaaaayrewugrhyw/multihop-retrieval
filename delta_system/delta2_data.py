@@ -22,8 +22,10 @@ Run: python delta2_data.py --n_edit 600 --n_para 600
 """
 
 import argparse
+import pickle
 import re
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -81,9 +83,21 @@ def lex_overlap(a: str, b: str) -> float:
     return len(sa & sb) / max(len(sa | sb), 1)
 
 
+# ── disk cache (VitaminC's 20k streaming scan is the per-run bottleneck) ─────────
+def _cache_dir():
+    base = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(tempfile.gettempdir())
+    d = base / "delta2_cache"; d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # ── loaders ────────────────────────────────────────────────────────────────────
-def load_edits(n, tok):
-    """IteraTeR (meaning-changed) + VitaminC contrast pairs -> edits with type + group id."""
+def load_edits(n, tok, cache=True):
+    """IteraTeR (meaning-changed) + VitaminC contrast pairs -> edits with type + group id.
+    Cached to disk: persists across cells/runs in a session so we stream VitaminC only ONCE."""
+    fp = _cache_dir() / f"edits_{n}.pkl"
+    if cache and fp.exists():
+        print(f"  [cache] edits <- {fp}")
+        return pickle.load(open(fp, "rb"))
     edits = []
     for k, p in enumerate(load_iterater(n // 2, tok)):
         edits.append({"A": p["A"], "B": p["B"], "type": change_type(p["A"], p["B"]),
@@ -91,7 +105,21 @@ def load_edits(n, tok):
     for p in load_vitaminc_pairs(n - len(edits)):
         edits.append({"A": p["A"], "B": p["B"], "type": change_type(p["A"], p["B"]),
                       "source": "vitaminc", "group": f"vc::{p['claim'][:60]}"})   # group by claim
+    if cache:
+        pickle.dump(edits, open(fp, "wb"))
     return edits
+
+
+def load_validated_paraphrases(n_cand, nli, ent_thr=0.6, max_overlap=0.85, cache=True):
+    """Validated paraphrase pairs, cached (roberta-large over n_cand x 2 directions is slow)."""
+    fp = _cache_dir() / f"paras_{n_cand}.pkl"
+    if cache and fp.exists():
+        print(f"  [cache] paraphrases <- {fp}")
+        return pickle.load(open(fp, "rb"))
+    valid, _ = validate_paraphrases(load_paraphrases(n_cand), nli, ent_thr, max_overlap)
+    if cache:
+        pickle.dump(valid, open(fp, "wb"))
+    return valid
 
 
 def load_paraphrases(n):
