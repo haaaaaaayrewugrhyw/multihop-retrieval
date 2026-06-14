@@ -288,6 +288,8 @@ def main():
                     help="instantiate the VIB variant (for wiki_model_vib.pt)")
     ap.add_argument("--slots", type=int, default=0,
                     help="instantiate the K-slot bottleneck variant (match training)")
+    ap.add_argument("--d0_aware", action="store_true",
+                    help="instantiate the A-aware delta_0 variant (match training)")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -312,7 +314,7 @@ def main():
     print()
 
     # ── Load model ─────────────────────────────────────────────────────────────
-    model = DeltaSystem(vib=args.vib, n_slots=args.slots).to(DEVICE)
+    model = DeltaSystem(vib=args.vib, n_slots=args.slots, d0_aware=args.d0_aware).to(DEVICE)
     ckpt  = _find_checkpoint(args.ckpt)
     if ckpt.exists():
         model.load_state_dict(

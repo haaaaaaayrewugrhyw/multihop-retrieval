@@ -36,11 +36,12 @@ A_DROP_P   = 0.20                     # A dropout probability in D_recon
 
 
 class DeltaSystem(nn.Module):
-    def __init__(self, vib: bool = False, n_slots: int = 0):
+    def __init__(self, vib: bool = False, n_slots: int = 0, d0_aware: bool = False):
         super().__init__()
-        self.vib     = vib       # soft variational information bottleneck on delta
-        self.last_kl = None      # per-element KL [b,T,D], set in generate_delta when vib
-        self.n_slots = n_slots   # >0: HARD bottleneck — decoder sees delta only via K slots
+        self.vib      = vib       # soft variational information bottleneck on delta
+        self.last_kl  = None      # per-element KL [b,T,D], set in generate_delta when vib
+        self.n_slots  = n_slots   # >0: HARD bottleneck — decoder sees delta only via K slots
+        self.d0_aware = d0_aware  # True: delta_0 = bottleneck(mean_B - mean_A) (A-aware)
 
         # ── Shared frozen BERT encoder ─────────────────────────────────────────
         self.bert = BertModel.from_pretrained("bert-base-uncased")
@@ -148,7 +149,14 @@ class DeltaSystem(nn.Module):
         # delta_0: compress mean-pooled H_B through bottleneck
         lens    = B_mask.float().sum(1, keepdim=True).clamp(min=1)
         B_mean  = (H_B * B_mask.unsqueeze(-1).float()).sum(1) / lens
-        delta_0 = self.g_bottle(B_mean)
+        if self.d0_aware:
+            # A-aware global summary: mean_B - mean_A (pure; no labels). Makes the
+            # delta_0 path USE A, so it can't be an A-blind escape from the slot bottleneck.
+            A_lens  = A_mask.float().sum(1, keepdim=True).clamp(min=1)
+            A_mean  = (H_A * A_mask.unsqueeze(-1).float()).sum(1) / A_lens
+            delta_0 = self.g_bottle(B_mean - A_mean)
+        else:
+            delta_0 = self.g_bottle(B_mean)
 
         # Return delta_norms as a proxy "alpha" for interface compatibility with eval/train
         alpha = delta.norm(dim=-1) / (D_MODEL ** 0.5)

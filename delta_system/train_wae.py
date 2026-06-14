@@ -143,15 +143,17 @@ def main():
     ap.add_argument("--margin",   type=float, default=2.0)
     ap.add_argument("--slots",    type=int,   default=0,
                     help="hard bottleneck: decoder sees delta via K slots (0=baseline)")
+    ap.add_argument("--d0_aware", action="store_true",
+                    help="A-aware delta_0 = bottleneck(mean_B - mean_A)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     if args.out is None:
-        args.out = ("/kaggle/working/checkpoints/wiki_model_wae_slots.pt"
-                    if args.slots > 0 else
-                    "/kaggle/working/checkpoints/wiki_model_wae.pt")
+        tag = ("_slots" if args.slots > 0 else "") + ("_d0aware" if args.d0_aware else "")
+        args.out = f"/kaggle/working/checkpoints/wiki_model_wae{tag}.pt"
 
-    print(f"Device: {DEVICE} | steps={args.steps} | SOURCE = scattered edits | slots={args.slots}")
-    print("ONLY the training data (+ optional slot bottleneck) differs from baseline.")
+    print(f"Device: {DEVICE} | steps={args.steps} | scattered edits | "
+          f"slots={args.slots} | d0_aware={args.d0_aware}")
+    print("ONLY the training data (+ optional slot/d0 changes) differs from baseline.")
 
     tok = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
@@ -163,7 +165,7 @@ def main():
 
     pairs = load_scattered_pairs(args.n_train, exclude)
 
-    model = DeltaSystem(n_slots=args.slots).to(DEVICE)     # hard bottleneck if slots>0
+    model = DeltaSystem(n_slots=args.slots, d0_aware=args.d0_aware).to(DEVICE)
     dl    = DataLoader(PairDS(pairs), batch_size=args.bs, shuffle=True,
                        collate_fn=make_col(tok), num_workers=2, pin_memory=True)
     opt   = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
