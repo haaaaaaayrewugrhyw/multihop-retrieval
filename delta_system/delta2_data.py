@@ -110,16 +110,38 @@ def load_edits(n, tok, cache=True):
     return edits
 
 
-def load_validated_paraphrases(n_cand, nli, ent_thr=0.6, max_overlap=0.85, cache=True):
-    """Validated paraphrase pairs, cached (roberta-large over n_cand x 2 directions is slow)."""
+def load_validated_paraphrases(n_cand, nli=None, ent_thr=0.6, max_overlap=0.85, cache=True):
+    """Validated paraphrase pairs, cached. NLI teacher is loaded LAZILY (only on cache miss),
+    so warm re-runs never touch roberta-large."""
     fp = _cache_dir() / f"paras_{n_cand}.pkl"
     if cache and fp.exists():
         print(f"  [cache] paraphrases <- {fp}")
         return pickle.load(open(fp, "rb"))
+    if nli is None:
+        nli = NLI()
     valid, _ = validate_paraphrases(load_paraphrases(n_cand), nli, ent_thr, max_overlap)
     if cache:
         pickle.dump(valid, open(fp, "wb"))
     return valid
+
+
+def load_edit_nli_labels(n, edits, nli=None, cache=True):
+    """NLI-teacher labels for the (cached, deterministic) edit set, cached to disk so re-runs
+    skip the 1.3 GB roberta-large load + relabeling entirely."""
+    fp = _cache_dir() / f"nli_labels_{n}.pkl"
+    if cache and fp.exists():
+        print(f"  [cache] nli labels <- {fp}")
+        labels = pickle.load(open(fp, "rb"))
+    else:
+        if nli is None:
+            nli = NLI()
+        nli_label_edits(edits, nli)
+        labels = [e["nli"] for e in edits]
+        if cache:
+            pickle.dump(labels, open(fp, "wb"))
+    for e, l in zip(edits, labels):
+        e["nli"] = l
+    return labels
 
 
 def load_paraphrases(n):

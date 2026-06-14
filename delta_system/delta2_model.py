@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from model       import DeltaSystem, D_MODEL
 from delta2_data import (load_edits, load_validated_paraphrases,
-                         nli_label_edits, NLI, NLI_LABELS)
+                         load_edit_nli_labels, NLI_LABELS)
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LEN = 128
@@ -146,17 +146,14 @@ def main():
 
     print("\nLoading data...")
     edits = load_edits(args.n_edit, tok)
-    paras, labels_t = None, None
-    nli = NLI()
+    paras, labels, labels_t = None, None, None
     if args.aux == "paraphrase":
-        paras = load_validated_paraphrases(1200, nli)
+        paras = load_validated_paraphrases(1200)        # NLI loaded lazily, only on cache miss
         print(f"  edits {len(edits)} | validated paraphrases {len(paras)}")
     else:
-        nli_label_edits(edits, nli)
-        labels = [NLI_LABELS.index(e["nli"]) for e in edits]
+        labels = [NLI_LABELS.index(l) for l in load_edit_nli_labels(args.n_edit, edits)]
         print(f"  edits {len(edits)} | nli labels "
               f"{ {l: labels.count(i) for i,l in enumerate(NLI_LABELS)} }")
-    del nli
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
 
