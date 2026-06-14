@@ -36,8 +36,10 @@ A_DROP_P   = 0.20                     # A dropout probability in D_recon
 
 
 class DeltaSystem(nn.Module):
-    def __init__(self):
+    def __init__(self, vib: bool = False):
         super().__init__()
+        self.vib     = vib       # soft variational information bottleneck on delta
+        self.last_kl = None      # per-element KL [b,T,D], set in generate_delta when vib
 
         # ── Shared frozen BERT encoder ─────────────────────────────────────────
         self.bert = BertModel.from_pretrained("bert-base-uncased")
@@ -57,6 +59,10 @@ class DeltaSystem(nn.Module):
         self.g_cross2 = nn.MultiheadAttention(D_MODEL, N_HEADS, batch_first=True, dropout=0.1)
         # Output projection
         self.g_out = nn.Linear(D_MODEL, D_MODEL)
+        # VIB heads: produce mu/logvar of the delta latent (soft info bottleneck)
+        if vib:
+            self.g_mu     = nn.Linear(D_MODEL, D_MODEL)
+            self.g_logvar = nn.Linear(D_MODEL, D_MODEL)
         # delta_0: compress mean-pooled B through a bottleneck
         self.g_bottle = nn.Sequential(
             nn.Linear(D_MODEL, D_SMALL),
@@ -112,11 +118,24 @@ class DeltaSystem(nn.Module):
         Os2, _ = self.g_self2(Q2, H_B, H_B, key_padding_mask=B_pad)
         Oc2, _ = self.g_cross2(Q2, H_A, H_A, key_padding_mask=A_pad)
 
-        # Subtract L2-normalized outputs -> delta
+        # Subtract L2-normalized outputs -> delta latent
         # Large where B is novel (Os2 ≠ Oc2), near-zero where B copies A (Os2 ≈ Oc2)
-        delta = torch.tanh(self.g_out(
-            F.normalize(Os2, dim=-1) - F.normalize(Oc2, dim=-1)
-        ))
+        z = F.normalize(Os2, dim=-1) - F.normalize(Oc2, dim=-1)
+        if self.vib:
+            # Variational bottleneck: delta ~ N(mu, sigma); KL(N(mu,sigma)||N(0,1))
+            # penalized in the loss limits the BITS delta carries -> forces novelty-only.
+            mu     = self.g_mu(z)
+            logvar = self.g_logvar(z).clamp(-8.0, 8.0)
+            if self.training:
+                std       = torch.exp(0.5 * logvar)
+                delta_pre = mu + std * torch.randn_like(std)
+            else:
+                delta_pre = mu                       # deterministic at eval
+            self.last_kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # [b,T,D]
+            delta = torch.tanh(delta_pre)
+        else:
+            self.last_kl = None
+            delta = torch.tanh(self.g_out(z))
 
         # delta_0: compress mean-pooled H_B through bottleneck
         lens    = B_mask.float().sum(1, keepdim=True).clamp(min=1)

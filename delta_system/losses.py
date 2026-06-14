@@ -65,6 +65,21 @@ def ortho_loss(delta: torch.Tensor, H_A: torch.Tensor,
     return (sim * real).sum() / real.sum().clamp(min=1)
 
 
+def kl_loss(kl_elementwise: torch.Tensor, B_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Aggregate the VIB per-element KL (model.last_kl, [b, T, D]) over real B tokens:
+    sum over the latent dim, mean over real tokens.
+
+    Penalizing this limits the BITS delta carries. Since the decoder already has all of A
+    for free, the cheapest way to keep recon low under a bit-budget is to encode only what
+    A lacks -> the novelty. This is the SOFT Information Bottleneck. It is NOT the magnitude
+    penalty sparsity_loss (which penalizes size, not information, and did not break collapse).
+    """
+    kl_tok = kl_elementwise.sum(dim=-1)            # [b, T]
+    real   = B_mask.float()
+    return (kl_tok * real).sum() / real.sum().clamp(min=1)
+
+
 def specificity_loss(
     logits_correct: torch.Tensor,
     logits_wrong:   torch.Tensor,

@@ -284,6 +284,8 @@ def main():
     ap.add_argument("--ckpt", default="/kaggle/working/checkpoints/wiki_model.pt")
     ap.add_argument("--n", type=int, default=500,
                     help="Number of IteraTeR pairs to evaluate")
+    ap.add_argument("--vib", action="store_true",
+                    help="instantiate the VIB variant (for wiki_model_vib.pt)")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -308,7 +310,7 @@ def main():
     print()
 
     # ── Load model ─────────────────────────────────────────────────────────────
-    model = DeltaSystem().to(DEVICE)
+    model = DeltaSystem(vib=args.vib).to(DEVICE)
     ckpt  = _find_checkpoint(args.ckpt)
     if ckpt.exists():
         model.load_state_dict(
