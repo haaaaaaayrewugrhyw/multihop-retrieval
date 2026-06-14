@@ -113,10 +113,21 @@ def main():
 
     feats = compute_features(bert, tok, pairs, args.tau)
 
-    idx = np.arange(len(pairs))
-    idx_tr, idx_te = train_test_split(idx, test_size=args.test_size,
-                                      random_state=42, stratify=labels)
+    # GROUP-AWARE split by claim: both mirror pairs (sup->ref and ref->sup) of a claim
+    # MUST stay on the same side. A random split leaks near-duplicate mirrors with flipped
+    # labels across train/test -> systematic below-chance. Group split fixes that, and makes
+    # it a real test: encode(B) can't separate the near-identical mirrors, a directional
+    # complement can.
+    claims = [p["claim"] for p in pairs]
+    uniq   = list(dict.fromkeys(claims))
+    rng_c  = np.random.default_rng(42)
+    rng_c.shuffle(uniq)
+    n_test = max(1, int(len(uniq) * args.test_size))
+    test_claims = set(uniq[:n_test])
+    idx_tr = np.array([i for i, p in enumerate(pairs) if p["claim"] not in test_claims])
+    idx_te = np.array([i for i, p in enumerate(pairs) if p["claim"] in test_claims])
     y_tr, y_te = labels[idx_tr], labels[idx_te]
+    print(f"  [group split by claim] train pairs {len(idx_tr)} | test pairs {len(idx_te)}")
     rng = np.random.default_rng(99); y_sh = y_tr.copy(); rng.shuffle(y_sh)
 
     print("\n" + "=" * 72)
@@ -137,16 +148,19 @@ def main():
     print(f"  {'reference: LEARNED delta probe':<40} {0.7975:>8.4f}")
     print("=" * 72)
 
-    gs = res["gate_sub"]
-    print("VERDICT")
-    if gs["acc"] > chance + 0.05 and gs["selectivity"] > 0.05 and gs["acc"] >= res["enc_B"]["acc"] - 0.01:
-        print("  SEMANTIC — the fixed op encodes factual-change DIRECTION, not just inserted text.")
-        print("  -> the IteraTeR win was real semantic novelty extraction. Scale it.")
-    elif gs["acc"] > chance + 0.05:
-        print("  PARTIAL — some semantic signal, but not clearly above encode(B). Inconclusive.")
+    gs_acc = res["gate_sub"]["acc"]
+    eb_acc = res["enc_B"]["acc"]
+    gain   = gs_acc - eb_acc
+    print("VERDICT  (group split: encode(B) can't separate near-identical mirrors;")
+    print("          a directional complement can -> gate_sub > encode(B) = semantic win)")
+    print(f"  gate_sub acc {gs_acc:.3f} | encode(B) acc {eb_acc:.3f} | gain {gain:+.3f} | chance {chance:.3f}")
+    if gs_acc > chance + 0.05 and gain > 0.05:
+        print("  SEMANTIC WIN — delta captures the DIRECTION of factual change that encode(B)")
+        print("  misses. The fixed complement is a real semantic 'what B adds' extractor.")
+    elif gs_acc > chance + 0.05:
+        print("  SIGNAL, NO EDGE — delta predicts the change but not better than encode(B).")
     else:
-        print("  LEXICAL — fixed op ~ chance/encode(B) here -> IteraTeR win was largely lexical")
-        print("     (locating inserted text), not semantic understanding of the change.")
+        print("  NO SIGNAL — delta ~ chance even with a clean split. Does not capture the change.")
     print("=" * 72)
 
 
