@@ -36,10 +36,11 @@ A_DROP_P   = 0.20                     # A dropout probability in D_recon
 
 
 class DeltaSystem(nn.Module):
-    def __init__(self, vib: bool = False):
+    def __init__(self, vib: bool = False, n_slots: int = 0):
         super().__init__()
         self.vib     = vib       # soft variational information bottleneck on delta
         self.last_kl = None      # per-element KL [b,T,D], set in generate_delta when vib
+        self.n_slots = n_slots   # >0: HARD bottleneck — decoder sees delta only via K slots
 
         # ── Shared frozen BERT encoder ─────────────────────────────────────────
         self.bert = BertModel.from_pretrained("bert-base-uncased")
@@ -86,7 +87,14 @@ class DeltaSystem(nn.Module):
         )
         self.dr_delta_enc = nn.TransformerEncoder(enc_layer, num_layers=N_LAYERS)
 
-        # Causal decoder: cross-attends to [delta_0 | H_A | enc(delta)]
+        # HARD bottleneck: K learned slots compress enc(delta) so the decoder cannot use
+        # delta as a full B-template (it must spend the slots on what A lacks = novelty).
+        if n_slots > 0:
+            self.dr_slots     = nn.Parameter(torch.randn(1, n_slots, D_MODEL) * 0.02)
+            self.dr_slot_attn = nn.MultiheadAttention(D_MODEL, N_HEADS,
+                                                      batch_first=True, dropout=0.1)
+
+        # Causal decoder: cross-attends to [delta_0 | H_A | enc(delta) or K slots]
         dec_layer = nn.TransformerDecoderLayer(
             D_MODEL, N_HEADS, dim_feedforward=2048, dropout=0.1,
             batch_first=True, norm_first=True,
@@ -165,28 +173,35 @@ class DeltaSystem(nn.Module):
             H_A    = H_A * keep.view(b, 1, 1)
             A_mask = (A_mask.float() * keep.view(b, 1)).long()
 
-        d0_mask = torch.ones(b, 1, dtype=torch.long, device=dev)
+        d0_mask    = torch.ones(b, 1, dtype=torch.long, device=dev)
+        delta_off  = ablate_delta or drop_delta          # token-delta path off
+        d0_off     = ablate_delta or drop_d0             # delta_0 path off
 
-        # Delta pathway (or zero everything for ablation)
-        if ablate_delta:
-            # ORIGINAL behavior: zero all delta info (d0_mask stays 1)
-            d0_tok     = torch.zeros(b, 1, D_MODEL, device=dev)
-            delta_enc  = torch.zeros(b, T, D_MODEL, device=dev)
-            delta_mask = torch.zeros(b, T, dtype=torch.long, device=dev)
-        else:
-            # token-level delta pathway
-            if drop_delta:
-                delta_enc  = torch.zeros(b, T, D_MODEL, device=dev)
-                delta_mask = torch.zeros(b, T, dtype=torch.long, device=dev)
+        # delta_0 pathway
+        d0_tok = torch.zeros(b, 1, D_MODEL, device=dev) if d0_off \
+                 else self.dr_d0(delta_0).unsqueeze(1)
+
+        # token-delta pathway -> either full T-length enc(delta) (baseline) or K slots (hard bottleneck)
+        if self.n_slots > 0:
+            if delta_off:
+                delta_mem  = torch.zeros(b, self.n_slots, D_MODEL, device=dev)
+                delta_mask = torch.zeros(b, self.n_slots, dtype=torch.long, device=dev)
             else:
                 delta_enc  = self.dr_delta_enc(delta, src_key_padding_mask=~B_mask.bool())
+                q          = self.dr_slots.expand(b, -1, -1)            # [b, K, D]
+                delta_mem, _ = self.dr_slot_attn(q, delta_enc, delta_enc,
+                                                 key_padding_mask=~B_mask.bool())
+                delta_mask = torch.ones(b, self.n_slots, dtype=torch.long, device=dev)
+        else:
+            if delta_off:
+                delta_mem  = torch.zeros(b, T, D_MODEL, device=dev)
+                delta_mask = torch.zeros(b, T, dtype=torch.long, device=dev)
+            else:
+                delta_mem  = self.dr_delta_enc(delta, src_key_padding_mask=~B_mask.bool())
                 delta_mask = B_mask
-            # delta_0 pathway
-            d0_tok = torch.zeros(b, 1, D_MODEL, device=dev) if drop_d0 \
-                     else self.dr_d0(delta_0).unsqueeze(1)
 
-        # Build memory: [delta_0_token | H_A | enc(delta)]
-        memory  = torch.cat([d0_tok,  H_A,    delta_enc ], dim=1)
+        # Build memory: [delta_0_token | H_A | delta_mem]
+        memory  = torch.cat([d0_tok,  H_A,    delta_mem ], dim=1)
         mem_pad = ~torch.cat([d0_mask, A_mask, delta_mask], dim=1).bool()
 
         # Decoder: shifted B tokens
