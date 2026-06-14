@@ -198,6 +198,7 @@ def eval_conditions(model: DeltaSystem, pairs: list,
         B_mask = eB["attention_mask"].to(DEVICE)
 
         # Encode + generate delta ONCE, then reconstruct under each condition
+        b = A_ids.size(0)
         H_A = model._enc(A_ids, A_mask)
         H_B = model._enc(B_ids, B_mask)
         delta, delta_0, _ = model.generate_delta(H_A, A_mask, H_B, B_mask)
