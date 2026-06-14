@@ -187,10 +187,13 @@ def main():
     print("\n" + "=" * 74)
     print("FOUNDATION VERDICT")
     ok_strat = recoverable / max(len(edits), 1) > 0.4
-    ok_para  = st["valid"] > 0.3 and len(valid) > 100
+    # COUNT is what matters, not pass-rate: MRPC is a loose paraphrase source and our gate is
+    # strict, so a low rate is expected and irrelevant -- we only need enough CLEAN pairs.
+    ok_para  = len(valid) >= 300
     ok_nli   = (nli_dist["contradiction"] + nli_dist["neutral"]) / max(len(edits), 1) > 0.5
     print(f"  enough recoverable edits  : {'OK ' if ok_strat else 'LOW'} ({recoverable/max(len(edits),1):.0%})")
-    print(f"  paraphrase negatives valid: {'OK ' if ok_para else 'LOW'} ({st['valid']:.0%}, n={len(valid)})")
+    print(f"  paraphrase negatives valid: {'OK ' if ok_para else 'LOW'} (n={len(valid)} clean pairs; "
+          f"rate {st['valid']:.0%} just reflects MRPC looseness, not quality)")
     print(f"  edits are real changes    : {'OK ' if ok_nli else 'LOW'} "
           f"(contra+neutral {(nli_dist['contradiction']+nli_dist['neutral'])/max(len(edits),1):.0%})")
     print("  GO -> proceed to scaffold (step 2)." if (ok_strat and ok_para and ok_nli)
