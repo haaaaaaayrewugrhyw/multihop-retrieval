@@ -41,6 +41,30 @@ def gate_loss(alpha: torch.Tensor, B_mask: torch.Tensor) -> torch.Tensor:
     return (alpha * real).sum() / real.sum().clamp(min=1)
 
 
+def ortho_loss(delta: torch.Tensor, H_A: torch.Tensor,
+               A_mask: torch.Tensor, B_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Anti-collapse orthogonality penalty.
+
+    L_ortho = mean over real B tokens of  max_j |cos(delta[t], H_A[j])|
+
+    Pushes each delta token to be orthogonal to ALL of A's token representations.
+    Since B = A + novel, encode(B) overlaps A on the shared content; penalizing
+    delta's alignment with A squeezes delta toward the B-beyond-A (novel) component
+    and forces the generator to actually USE A. Range [0, 1] (lower = more orthogonal).
+
+    Target metric this is meant to move: the eval's A-dependence fraction (was ~6%).
+    """
+    d = F.normalize(delta, dim=-1)                 # [b, T_B, D]
+    a = F.normalize(H_A,  dim=-1)                  # [b, T_A, D]
+    cos = torch.bmm(d, a.transpose(1, 2)).abs()    # [b, T_B, T_A]
+    a_valid = A_mask.unsqueeze(1).float()          # [b, 1, T_A] -- ignore padded A
+    cos = cos * a_valid
+    sim = cos.max(dim=-1).values                   # [b, T_B] worst-case alignment
+    real = B_mask.float()
+    return (sim * real).sum() / real.sum().clamp(min=1)
+
+
 def specificity_loss(
     logits_correct: torch.Tensor,
     logits_wrong:   torch.Tensor,
