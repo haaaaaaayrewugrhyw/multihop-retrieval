@@ -95,9 +95,18 @@ def load_edits(n, tok):
 
 
 def load_paraphrases(n):
-    """MRPC paraphrase pairs (label=1) as raw candidates (validated separately)."""
-    mrpc = load_dataset("glue", "mrpc", split="train")
-    pos = [(ex["sentence1"], ex["sentence2"]) for ex in mrpc if ex["label"] == 1]
+    """MRPC paraphrase pairs (label=1) across ALL splits as raw candidates (validated
+    separately). MRPC's notion of 'equivalent' is loose (asymmetric add/drop clauses), so the
+    strict bidirectional-NLI gate keeps only ~18% -- we pull the whole positive pool (~3.9k) so
+    enough survive WITHOUT weakening the gate."""
+    pos, seen = [], set()
+    for split in ("train", "validation", "test"):
+        for ex in load_dataset("glue", "mrpc", split=split):
+            if ex["label"] == 1:
+                key = (ex["sentence1"], ex["sentence2"])
+                if key not in seen:
+                    seen.add(key)
+                    pos.append(key)
     return pos[:n]
 
 
