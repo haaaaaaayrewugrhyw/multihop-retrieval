@@ -10,11 +10,12 @@ Adds, with NO token decoder:
     what A LACKS = novelty.
   - swappable AUX:
       paraphrase: ||delta_vec(A, paraphrase)|| -> 0  &  ||delta_vec(A, real-edit B)|| kept >= 1
-                  (surface-invariance: meaning-preserving rewrite => no delta; real change => delta)
       nli       : nli_head(delta_vec) -> entail/neutral/contradict (teacher-distilled)
 
 Trains ONLY the generator (core "g_*") + the new heads; BERT stays frozen; the token decoder is
-never called. __main__ runs a short SANITY-TRAIN and prints whether it actually learns.
+never called. SPEED: BERT is frozen, so we encode every sentence through it ONCE up front and
+cache the hidden states; each training step then runs only the tiny trainable generator (no
+repeated BERT forwards). __main__ runs a short SANITY-TRAIN and prints whether it learns.
 
 Run: python delta2_model.py --aux paraphrase --steps 400
      python delta2_model.py --aux nli        --steps 400
@@ -67,15 +68,17 @@ class Delta2(nn.Module):
             ps += list(self.nli_head.parameters())
         return ps
 
-    def delta_vec(self, A_ids, A_m, B_ids, B_m):
-        H_A = self.core._enc(A_ids, A_m)
-        H_B = self.core._enc(B_ids, B_m)
+    @torch.no_grad()
+    def encode(self, ids, m):
+        return self.core._enc(ids, m)                   # frozen BERT (no grad)
+
+    def delta_from_H(self, H_A, A_m, H_B, B_m):
+        """delta_vec from PRECOMPUTED frozen-BERT hidden states (no BERT forward here)."""
         delta, _delta0, alpha = self.core.generate_delta(H_A, A_m, H_B, B_m)
-        # novelty-weighted pool: emphasize tokens where B diverges from A
-        w = alpha * B_m.float()
+        w = alpha * B_m.float()                          # novelty-weighted pool
         w = w / w.sum(1, keepdim=True).clamp(min=1e-6)
-        pooled = (delta * w.unsqueeze(-1)).sum(1)       # [b,768]
-        return self.delta_proj(pooled), H_A, H_B
+        pooled = (delta * w.unsqueeze(-1)).sum(1)        # [b,768]
+        return self.delta_proj(pooled)
 
     def anchor_loss(self, dv, H_A, A_m, H_B, B_m):
         pred   = self.anchor(torch.cat([dv, masked_mean(H_A, A_m)], dim=-1))
@@ -83,37 +86,46 @@ class Delta2(nn.Module):
         return (1 - F.cosine_similarity(pred, target, dim=-1)).mean(), pred, target
 
 
-# ── data tensors ────────────────────────────────────────────────────────────────
-def enc(tok, texts):
+# ── tokenize + one-time frozen-BERT encoding ─────────────────────────────────────
+def enc_ids(tok, texts):
     e = tok(texts, max_length=MAX_LEN, truncation=True, padding="max_length", return_tensors="pt")
     return e["input_ids"].to(DEVICE), e["attention_mask"].to(DEVICE)
 
 
-def batch(items, key_a, key_b, idx, tok):
-    A = [items[i][key_a] for i in idx]
-    B = [items[i][key_b] for i in idx]
-    A_ids, A_m = enc(tok, A); B_ids, B_m = enc(tok, B)
-    return A_ids, A_m, B_ids, B_m
+@torch.no_grad()
+def encode_all(model, items, ka, kb, tok, bs=32):
+    """Run frozen BERT over every (A,B) pair ONCE; cache hidden states on device."""
+    HA, AM, HB, BM = [], [], [], []
+    for i in range(0, len(items), bs):
+        chunk = items[i:i + bs]
+        a_ids, a_m = enc_ids(tok, [x[ka] for x in chunk])
+        b_ids, b_m = enc_ids(tok, [x[kb] for x in chunk])
+        HA.append(model.encode(a_ids, a_m)); AM.append(a_m)
+        HB.append(model.encode(b_ids, b_m)); BM.append(b_m)
+    return {"H_A": torch.cat(HA), "A_m": torch.cat(AM),
+            "H_B": torch.cat(HB), "B_m": torch.cat(BM)}
+
+
+def take(C, idx):
+    return C["H_A"][idx], C["A_m"][idx], C["H_B"][idx], C["B_m"][idx]
 
 
 @torch.no_grad()
-def evaluate(model, edits, paras, labels, tok, n=64):
+def evaluate(model, E, P, labels_t, n=64):
     model.eval()
-    idx = list(range(min(n, len(edits))))
-    A_ids, A_m, B_ids, B_m = batch(edits, "A", "B", idx, tok)
-    dv_e, H_A, H_B = model.delta_vec(A_ids, A_m, B_ids, B_m)
+    s = torch.arange(min(n, E["H_A"].size(0)), device=DEVICE)
+    H_A, A_m, H_B, B_m = take(E, s)
+    dv_e = model.delta_from_H(H_A, A_m, H_B, B_m)
     _, pred, target = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
-    anc_cos = F.cosine_similarity(pred, target, dim=-1).mean().item()
-    out = {"anchor_cos": anc_cos, "edit_norm": dv_e.norm(dim=-1).mean().item()}
-    if model.aux == "paraphrase" and paras:
-        pidx = list(range(min(n, len(paras))))
-        pa, pam, pb, pbm = batch(paras, "A", "A_para", pidx, tok)
-        dv_p, _, _ = model.delta_vec(pa, pam, pb, pbm)
-        out["para_norm"] = dv_p.norm(dim=-1).mean().item()
+    out = {"anchor_cos": F.cosine_similarity(pred, target, dim=-1).mean().item(),
+           "edit_norm":  dv_e.norm(dim=-1).mean().item()}
+    if model.aux == "paraphrase" and P is not None:
+        ps = torch.arange(min(n, P["H_A"].size(0)), device=DEVICE)
+        dv_p = model.delta_from_H(*take(P, ps))
+        out["para_norm"]  = dv_p.norm(dim=-1).mean().item()
         out["separation"] = out["edit_norm"] / max(out["para_norm"], 1e-6)
     if model.aux == "nli":
-        logits = model.nli_head(dv_e)
-        out["nli_acc"] = (logits.argmax(-1) == torch.tensor(labels[:len(idx)], device=DEVICE)).float().mean().item()
+        out["nli_acc"] = (model.nli_head(dv_e).argmax(-1) == labels_t[s]).float().mean().item()
     model.train()
     return out
 
@@ -134,7 +146,7 @@ def main():
 
     print("\nLoading data...")
     edits = load_edits(args.n_edit, tok)
-    paras, labels = None, None
+    paras, labels_t = None, None
     nli = NLI()
     if args.aux == "paraphrase":
         paras = load_validated_paraphrases(1200, nli)
@@ -152,29 +164,34 @@ def main():
     opt = torch.optim.Adam(model.trainable_parameters(), lr=args.lr)
     rng = np.random.default_rng(0)
 
-    print("\nBEFORE:", {k: round(v, 3) for k, v in evaluate(model, edits, paras, labels, tok).items()})
+    print("Encoding through frozen BERT (one-time)...")
+    E = encode_all(model, edits, "A", "B", tok)
+    P = encode_all(model, paras, "A", "A_para", tok) if args.aux == "paraphrase" else None
+    if args.aux == "nli":
+        labels_t = torch.tensor(labels, device=DEVICE)
+    N = E["H_A"].size(0)
+
+    print("BEFORE:", {k: round(v, 3) for k, v in evaluate(model, E, P, labels_t).items()})
     print()
     for step in range(1, args.steps + 1):
-        idx = rng.integers(0, len(edits), args.bs)
-        A_ids, A_m, B_ids, B_m = batch(edits, "A", "B", idx, tok)
-        dv_e, H_A, H_B = model.delta_vec(A_ids, A_m, B_ids, B_m)
+        idx = torch.as_tensor(rng.integers(0, N, args.bs), device=DEVICE)
+        H_A, A_m, H_B, B_m = take(E, idx)
+        dv_e = model.delta_from_H(H_A, A_m, H_B, B_m)
         anc, _, _ = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
 
         if args.aux == "paraphrase":
-            pidx = rng.integers(0, len(paras), args.bs)
-            pa, pam, pb, pbm = batch(paras, "A", "A_para", pidx, tok)
-            dv_p, _, _ = model.delta_vec(pa, pam, pb, pbm)
+            pidx = torch.as_tensor(rng.integers(0, P["H_A"].size(0), args.bs), device=DEVICE)
+            dv_p = model.delta_from_H(*take(P, pidx))
             aux = dv_p.norm(dim=-1).mean() + F.relu(1.0 - dv_e.norm(dim=-1)).mean()
         else:
-            lab = torch.tensor([labels[i] for i in idx], device=DEVICE)
-            aux = F.cross_entropy(model.nli_head(dv_e), lab)
+            aux = F.cross_entropy(model.nli_head(dv_e), labels_t[idx])
 
         loss = anc + aux
         opt.zero_grad(); loss.backward(); opt.step()
         if step % 50 == 0:
             print(f"  step {step:>4} | loss {loss.item():.3f} | anchor {anc.item():.3f} | aux {aux.item():.3f}")
 
-    after = evaluate(model, edits, paras, labels, tok)
+    after = evaluate(model, E, P, labels_t)
     print("\nAFTER :", {k: round(v, 3) for k, v in after.items()})
 
     print("\n" + "=" * 74)
