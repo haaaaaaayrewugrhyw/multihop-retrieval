@@ -83,6 +83,10 @@ class Delta2(nn.Module):
                                         nn.Linear(proj, proj))
         self.anchor = nn.Sequential(nn.Linear(proj + D_MODEL, D_MODEL), nn.GELU(),
                                     nn.Linear(D_MODEL, D_MODEL))
+        # v3: LINEAR map delta -> gold-novelty content (target A does not contain). Linear so the
+        # objective matches the linear readout metric: the decisive test of whether a pooled delta
+        # can LINEARLY carry "what B adds" at all.
+        self.novel_head = nn.Linear(proj, D_MODEL)
         if aux == "nli":
             self.nli_head = nn.Sequential(nn.Linear(proj, proj), nn.GELU(),
                                           nn.Linear(proj, 3))
@@ -90,6 +94,7 @@ class Delta2(nn.Module):
     def trainable_parameters(self):
         ps  = [p for n, p in self.core.named_parameters() if n.startswith("g_")]
         ps += list(self.delta_proj.parameters()) + list(self.anchor.parameters())
+        ps += list(self.novel_head.parameters())
         if self.aux == "nli":
             ps += list(self.nli_head.parameters())
         return ps
