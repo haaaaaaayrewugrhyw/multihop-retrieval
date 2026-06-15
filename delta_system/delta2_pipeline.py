@@ -127,7 +127,7 @@ def main():
           f"false-positive rate {fpr:.3f} | AUC {auc(G['te_e'], G['te_p']):.3f}")
 
     # ── STAGE 2: extract on test edits (token complement) ───────────────────────
-    comp, g = op(E_te["H_A"], E_te["H_B"], E_te["A_m"])
+    comp, g = op(E_te["H_A"], E_te["H_B"], E_te["A_m"], 0.1)
     comp_np, g_np = comp.cpu().numpy(), g.cpu().numpy()
     HB_np, Bm_np = E_te["H_B"].cpu().numpy(), E_te["B_m"].cpu().numpy()
     extr, gold, typ, idx = [], [], [], []
