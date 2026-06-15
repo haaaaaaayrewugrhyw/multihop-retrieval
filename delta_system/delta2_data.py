@@ -160,6 +160,37 @@ def load_edit_nli_labels(n, edits, nli=None, cache=True):
     return labels
 
 
+def load_iterater_by_meaning(n, meaning=True, cache=True):
+    """IteraTeR sentence pairs filtered by label: meaning-changed (meaning=True) vs NOT
+    (fluency/clarity/coherence = same-domain, meaning-PRESERVING edits). Cached.
+    Returns list of {before, after, group}. The non-meaning set is the clean same-domain negative
+    for the gate test (rules out the MRPC-news vs wiki domain confound)."""
+    tag = "mean" if meaning else "nonmean"
+    fp = _cache_dir() / f"iter_{tag}_{n}.pkl"
+    if cache and fp.exists():
+        print(f"  [cache] iterater-{tag} <- {fp}")
+        return pickle.load(open(fp, "rb"))
+    ds = load_dataset("wanyu/IteraTeR_human_sent", split="train", streaming=True)
+    out = []
+    for ex in ds:
+        labels = ex.get("labels") or []
+        if isinstance(labels, str):
+            labels = [labels]
+        ism = any("meaning" in str(l).lower() for l in labels)
+        if ism != meaning:
+            continue
+        b = (ex.get("before_sent") or "").strip()
+        a = (ex.get("after_sent") or "").strip()
+        if len(b) < 20 or len(a) < 20:
+            continue
+        out.append({"before": b, "after": a, "group": f"it{tag}{len(out)}"})
+        if len(out) >= n:
+            break
+    if cache:
+        pickle.dump(out, open(fp, "wb"))
+    return out
+
+
 def load_paraphrases(n):
     """MRPC paraphrase pairs (label=1) across ALL splits as raw candidates (validated
     separately). MRPC's notion of 'equivalent' is loose (asymmetric add/drop clauses), so the
