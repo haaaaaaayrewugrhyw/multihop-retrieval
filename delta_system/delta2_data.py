@@ -67,7 +67,9 @@ def change_type(A: str, B: str) -> str:
 class NLI:
     def __init__(self):
         self.tok = AutoTokenizer.from_pretrained(NLI_NAME)
-        self.m   = AutoModelForSequenceClassification.from_pretrained(NLI_NAME).to(DEVICE).eval()
+        dt = torch.float16 if torch.cuda.is_available() else torch.float32   # half = less VRAM/RAM
+        self.m  = AutoModelForSequenceClassification.from_pretrained(
+            NLI_NAME, torch_dtype=dt, low_cpu_mem_usage=True).to(DEVICE).eval()
 
     @torch.no_grad()
     def probs(self, prem, hyp, bs=16):
@@ -75,7 +77,7 @@ class NLI:
         for i in range(0, len(prem), bs):
             enc = self.tok(prem[i:i + bs], hyp[i:i + bs], truncation=True, max_length=256,
                            padding=True, return_tensors="pt").to(DEVICE)
-            out.append(F.softmax(self.m(**enc).logits, dim=-1).cpu().numpy())
+            out.append(F.softmax(self.m(**enc).logits.float(), dim=-1).cpu().numpy())
         return np.concatenate(out)            # [n,3] cols: contra, neutral, entail
 
 

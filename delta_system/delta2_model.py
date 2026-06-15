@@ -149,7 +149,7 @@ def main():
     ap.add_argument("--aux", choices=["paraphrase", "nli"], default="paraphrase")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--bs", type=int, default=16)
-    ap.add_argument("--n_edit", type=int, default=300)
+    ap.add_argument("--n_edit", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1e-4)
     args = ap.parse_args()
 
@@ -162,7 +162,7 @@ def main():
     edits = load_edits(args.n_edit, tok)
     paras, labels, labels_t = None, None, None
     if args.aux == "paraphrase":
-        paras = load_validated_paraphrases(1200)        # NLI loaded lazily, only on cache miss
+        paras = load_validated_paraphrases(600)         # NLI loaded lazily, only on cache miss
         print(f"  edits {len(edits)} | validated paraphrases {len(paras)}")
     else:
         labels = [NLI_LABELS.index(l) for l in load_edit_nli_labels(args.n_edit, edits)]

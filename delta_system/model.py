@@ -44,7 +44,8 @@ class DeltaSystem(nn.Module):
         self.d0_aware = d0_aware  # True: delta_0 = bottleneck(mean_B - mean_A) (A-aware)
 
         # ── Shared frozen BERT encoder ─────────────────────────────────────────
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        # low_cpu_mem_usage: stream weights in to keep the RAM load-peak small.
+        self.bert = BertModel.from_pretrained("bert-base-uncased", low_cpu_mem_usage=True)
         for p in self.bert.parameters():
             p.requires_grad_(False)
 
