@@ -38,7 +38,7 @@ from sklearn.linear_model import LogisticRegression, Ridge
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from model        import DeltaSystem  # noqa: F401  (shared defs)
-from delta2_model import Delta2, encode_all, take, masked_mean, DEVICE, MAX_LEN
+from delta2_model import Delta2, encode_all, take, masked_mean, vicreg_loss, DEVICE, MAX_LEN
 from delta2_data  import (load_edits, load_validated_paraphrases, load_edit_nli_labels,
                           group_split, change_type, NLI_LABELS)
 from insertion_cloze_eval import _novel_mask_difflib
@@ -46,7 +46,7 @@ from transformers import BertTokenizerFast
 
 
 # ── training (same objective as step 2, TRAIN split only) ────────────────────────
-def train(aux, E, P, labels, steps, lr=1e-4, bs=16, seed=0):
+def train(aux, E, P, labels, steps, mode="v2", temp=0.1, lr=1e-4, bs=32, seed=0):
     model = Delta2(aux).to(DEVICE).train()
     opt = torch.optim.Adam(model.trainable_parameters(), lr=lr)
     rng = np.random.default_rng(seed)
@@ -56,7 +56,12 @@ def train(aux, E, P, labels, steps, lr=1e-4, bs=16, seed=0):
         idx = torch.as_tensor(rng.integers(0, N, bs), device=DEVICE)
         H_A, A_m, H_B, B_m = take(E, idx)
         dv_e = model.delta_from_H(H_A, A_m, H_B, B_m)
-        anc, _, _ = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
+        if mode == "v2":
+            anc = model.contrastive_anchor_loss(dv_e, H_A, A_m, H_B, B_m, temp)
+            var_l, cov_l = vicreg_loss(dv_e)
+            anc = anc + 1.0 * var_l + 0.04 * cov_l
+        else:
+            anc, _, _ = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
         if aux == "paraphrase":
             pidx = torch.as_tensor(rng.integers(0, P["H_A"].size(0), bs), device=DEVICE)
             dv_p = model.delta_from_H(*take(P, pidx))
@@ -192,14 +197,15 @@ def main():
     y_te = np.array([NLI_LABELS.index(e["nli"]) for e in te_e])
     types_te = np.array([e["type"] for e in te_e])
 
-    print("\nTraining paraphrase-aux..."); m_par = train("paraphrase", E_tr, P_tr, None, args.steps)
-    print("Training nli-aux...");          m_nli = train("nli", E_tr, None, list(y_tr), args.steps)
+    print("\nTraining paraphrase v2 (contrastive+VICReg)..."); m_par = train("paraphrase", E_tr, P_tr, None, args.steps, "v2")
+    print("Training nli v2...");                                m_nli = train("nli", E_tr, None, list(y_tr), args.steps, "v2")
+    print("Training paraphrase v1 (old anchor, for comparison)..."); m_par1 = train("paraphrase", E_tr, P_tr, None, args.steps, "v1")
 
     encB_tr, diff_tr = rep_pool(E_tr); encB_te, diff_te = rep_pool(E_te)
-    reps_tr = {"delta_para": rep_delta(m_par, E_tr), "delta_nli": rep_delta(m_nli, E_tr),
-               "encB": encB_tr, "meandiff": diff_tr}
-    reps_te = {"delta_para": rep_delta(m_par, E_te), "delta_nli": rep_delta(m_nli, E_te),
-               "encB": encB_te, "meandiff": diff_te}
+    reps_tr = {"para_v2": rep_delta(m_par, E_tr), "nli_v2": rep_delta(m_nli, E_tr),
+               "para_v1": rep_delta(m_par1, E_tr), "encB": encB_tr, "meandiff": diff_tr}
+    reps_te = {"para_v2": rep_delta(m_par, E_te), "nli_v2": rep_delta(m_nli, E_te),
+               "para_v1": rep_delta(m_par1, E_te), "encB": encB_te, "meandiff": diff_te}
 
     G_tr, k_tr = stack_golds(golds_novel(E_tr, tr_e, tok))
     G_te, k_te = stack_golds(golds_novel(E_te, te_e, tok))
@@ -225,7 +231,7 @@ def main():
 
     # 3. surface-invariance (held-out paraphrases)
     print("\n[3] Surface-invariance: ||delta|| held-out paraphrases vs edits (want para << edit):")
-    for name, mdl in [("delta_para", m_par), ("delta_nli", m_nli)]:
+    for name, mdl in [("para_v2", m_par), ("nli_v2", m_nli), ("para_v1", m_par1)]:
         de = np.linalg.norm(rep_delta(mdl, E_te), axis=1).mean()
         dp = np.linalg.norm(rep_delta(mdl, P_te), axis=1).mean()
         print(f"    {name:<11} edit={de:7.3f}  para={dp:7.3f}  ratio={de/max(dp,1e-6):8.2f}")
@@ -234,7 +240,7 @@ def main():
     print("\n[4] A-dependence: content cos with CORRECT vs SHUFFLED A (drop => delta uses A):")
     perm = np.random.default_rng(0).permutation(E_te["H_A"].size(0))
     E_sh = {"H_A": E_te["H_A"][perm], "A_m": E_te["A_m"][perm], "H_B": E_te["H_B"], "B_m": E_te["B_m"]}
-    for name, mdl in [("delta_para", m_par), ("delta_nli", m_nli)]:
+    for name, mdl in [("para_v2", m_par), ("nli_v2", m_nli), ("para_v1", m_par1)]:
         rt = rep_delta(mdl, E_tr); ro = rep_delta(mdl, E_te); rs = rep_delta(mdl, E_sh)
         r = Ridge(alpha=1.0).fit(rt[k_tr], G_tr)
         c_ok = mean_cos(r.predict(ro[k_te]), G_te); c_sh = mean_cos(r.predict(rs[k_te]), G_te)

@@ -61,6 +61,18 @@ def masked_mean(H, m):
     return (H * w).sum(1) / w.sum(1).clamp(min=1e-6)
 
 
+def vicreg_loss(z, gamma=1.0):
+    """Anti-collapse (VICReg): keep per-dim std >= gamma (variance) + decorrelate (covariance).
+    Prevents the rank-1 collapse the per-example anchor allowed."""
+    std = torch.sqrt(z.var(dim=0) + 1e-4)
+    var_l = F.relu(gamma - std).mean()
+    zc = z - z.mean(0)
+    cov = (zc.t() @ zc) / max(z.size(0) - 1, 1)
+    off = cov - torch.diag(torch.diagonal(cov))
+    cov_l = (off ** 2).sum() / z.size(1)
+    return var_l, cov_l
+
+
 class Delta2(nn.Module):
     def __init__(self, aux="paraphrase", proj=PROJ):
         super().__init__()
@@ -98,6 +110,15 @@ class Delta2(nn.Module):
         pred   = self.anchor(torch.cat([dv, masked_mean(H_A, A_m)], dim=-1))
         target = masked_mean(H_B, B_m)
         return (1 - F.cosine_similarity(pred, target, dim=-1)).mean(), pred, target
+
+    def contrastive_anchor_loss(self, dv, H_A, A_m, H_B, B_m, temp=0.1):
+        """InfoNCE anchor: [pool(A_i), delta_i] must reconstruct encode(B_i) BETTER than B_j.
+        Forces delta to carry pair-specific novelty (the per-example cosine anchor did not)."""
+        pred = F.normalize(self.anchor(torch.cat([dv, masked_mean(H_A, A_m)], dim=-1)), dim=-1)
+        tgt  = F.normalize(masked_mean(H_B, B_m), dim=-1)
+        logits = pred @ tgt.t() / temp                       # [b,b]
+        labels = torch.arange(pred.size(0), device=pred.device)
+        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
 
 
 # ── tokenize + one-time frozen-BERT encoding ─────────────────────────────────────
@@ -147,8 +168,11 @@ def evaluate(model, E, P, labels_t, n=64):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--aux", choices=["paraphrase", "nli"], default="paraphrase")
+    ap.add_argument("--mode", choices=["v1", "v2"], default="v2",
+                    help="v1=per-example cosine anchor; v2=contrastive InfoNCE anchor + VICReg")
+    ap.add_argument("--temp", type=float, default=0.1)
     ap.add_argument("--steps", type=int, default=400)
-    ap.add_argument("--bs", type=int, default=16)
+    ap.add_argument("--bs", type=int, default=32)
     ap.add_argument("--n_edit", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1e-4)
     args = ap.parse_args()
@@ -189,7 +213,12 @@ def main():
         idx = torch.as_tensor(rng.integers(0, N, args.bs), device=DEVICE)
         H_A, A_m, H_B, B_m = take(E, idx)
         dv_e = model.delta_from_H(H_A, A_m, H_B, B_m)
-        anc, _, _ = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
+        if args.mode == "v2":
+            anc = model.contrastive_anchor_loss(dv_e, H_A, A_m, H_B, B_m, args.temp)
+            var_l, cov_l = vicreg_loss(dv_e)
+            anc = anc + 1.0 * var_l + 0.04 * cov_l
+        else:
+            anc, _, _ = model.anchor_loss(dv_e, H_A, A_m, H_B, B_m)
 
         if args.aux == "paraphrase":
             pidx = torch.as_tensor(rng.integers(0, P["H_A"].size(0), args.bs), device=DEVICE)
