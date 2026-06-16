@@ -97,9 +97,11 @@ def mem_delta(model, E, idx, mode):
     return comp
 
 
-def token_acc(logits, tgt):
-    pred = logits.argmax(-1); mask = (tgt != 0)
-    return ((pred == tgt) & mask).float().sum() / mask.float().sum().clamp(min=1)
+def token_acc(logits, tgt, k=1):
+    mask = (tgt != 0)
+    topk = logits.topk(k, dim=-1).indices                 # [b,L,k]
+    hit = (topk == tgt.unsqueeze(-1)).any(-1)
+    return (hit & mask).float().sum() / mask.float().sum().clamp(min=1)
 
 
 def run(mode, E_tr, T_tr, E_te, T_te, steps, seed, bs=24):
@@ -119,15 +121,16 @@ def run(mode, E_tr, T_tr, E_te, T_te, steps, seed, bs=24):
     with torch.no_grad():
         accs = {}
         for ab, key in [(False, "with"), (True, "ablate")]:
-            tot, n = 0.0, 0
+            t1, t5, n = 0.0, 0.0, 0
             for i in range(0, E_te["H_A"].size(0), 64):
                 idx = torch.arange(i, min(i + 64, E_te["H_A"].size(0)), device=DEVICE)
                 H_A, A_m, H_B, B_m = take(E_te, idx)
                 md = mem_delta(model, E_te, idx, mode)
                 lg = model.decode(H_A, A_m, md, B_m, T_te[idx], ablate=ab)
-                tot += token_acc(lg, T_te[idx]).item() * len(idx); n += len(idx)
-            accs[key] = tot / n
-    return accs["with"], accs["ablate"]
+                t1 += token_acc(lg, T_te[idx], 1).item() * len(idx)
+                t5 += token_acc(lg, T_te[idx], 5).item() * len(idx); n += len(idx)
+            accs[key] = (t1 / n, t5 / n)
+    return accs["with"], accs["ablate"]                    # each = (top1, top5)
 
 
 def main():
@@ -156,18 +159,19 @@ def main():
             torch.cuda.empty_cache()
         T_tr, T_te = novel_targets(tr, tok), novel_targets(te, tok)
         for mode in ("learned", "complement"):
-            w, a = run(mode, E_tr, T_tr, E_te, T_te, args.steps, seed)
+            w, a = run(mode, E_tr, T_tr, E_te, T_te, args.steps, seed)   # w=(top1,top5), a=(top1,top5)
             rows[mode].append((w, a))
-            print(f"  seed {seed} {mode:<10} held-out novel-token acc: with-delta {w:.3f} | "
-                  f"ablated {a:.3f} | LIFT {w-a:+.3f}")
+            print(f"  seed {seed} {mode:<10} top1 with {w[0]:.3f}/ab {a[0]:.3f} LIFT {w[0]-a[0]:+.3f}  |  "
+                  f"top5 with {w[1]:.3f}/ab {a[1]:.3f} LIFT {w[1]-a[1]:+.3f}")
 
     print("\n" + "=" * 82)
     for mode in ("learned", "complement"):
-        w = np.mean([x[0] for x in rows[mode]]); a = np.mean([x[1] for x in rows[mode]])
-        print(f"  {mode:<10} acc(with) {w:.3f}  acc(ablate) {a:.3f}  LIFT {w-a:+.3f}")
+        w1 = np.mean([x[0][0] for x in rows[mode]]); a1 = np.mean([x[1][0] for x in rows[mode]])
+        w5 = np.mean([x[0][1] for x in rows[mode]]); a5 = np.mean([x[1][1] for x in rows[mode]])
+        print(f"  {mode:<10} top1 lift {w1-a1:+.3f} (with {w1:.3f}) | top5 lift {w5-a5:+.3f} (with {w5:.3f})")
     print("\nREAD (fair, trained, held-out, neutral metric):")
-    print("  learned LIFT >= complement LIFT  => learned delta carries the novel content (idea viable)")
-    print("  learned LIFT <  complement LIFT  => complement still better, fairly")
+    print("  delta LIFT (with - ablate) is what the delta itself contributes. Compare learned vs complement.")
+    print("  If both top5 ~ floor => generation too hard to discriminate (inconclusive, not a verdict).")
     print("=" * 82)
 
 
