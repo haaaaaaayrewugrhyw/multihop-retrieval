@@ -174,9 +174,13 @@ def main():
     sidx = torch.as_tensor(rng.integers(0, Ns, args.bs), device=DEVICE)
     Ls = batch_losses(idx, sidx)
     gp = model.gen_params()
-    g_content = torch.cat([g.flatten() for g in torch.autograd.grad(Ls[2], gp, retain_graph=True, allow_unused=True) if g is not None])
-    g_inv = torch.cat([g.flatten() for g in torch.autograd.grad(Ls[3], gp, retain_graph=True, allow_unused=True) if g is not None])
-    cos_ci = F.cosine_similarity(g_content, g_inv, dim=0).item()
+
+    def flat_grad(L):
+        gs = torch.autograd.grad(L, gp, retain_graph=True, allow_unused=True)
+        return torch.cat([(g if g is not None else torch.zeros_like(p)).flatten()
+                          for g, p in zip(gs, gp)])
+
+    cos_ci = F.cosine_similarity(flat_grad(Ls[2]), flat_grad(Ls[3]), dim=0).item()
 
     print("\n" + "=" * 80)
     print(f"PULL(content) vs gate(inv) gradient cosine = {cos_ci:+.3f}  "
