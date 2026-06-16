@@ -66,15 +66,25 @@ python train.py --sweep --dataset cifar10
 
 ## Kaggle (free 16GB GPU — for the full sweep)
 
-New Kaggle Notebook → Settings → Accelerator = **GPU T4 x2** (or P100).
-Paste into a cell (replace with your repo URL):
+New Kaggle Notebook → Settings:
+- **Accelerator = GPU T4 x2** (or P100)
+- **Internet = ON**  (torchvision downloads MNIST/CIFAR on first run)
+
+Paste into one cell and run (repo is public, no token needed):
 
 ```python
-!git clone https://github.com/<you>/<repo>.git
-%cd <repo>/experiments/cross_layer_attention
+!git clone -b cross-layer-attention https://github.com/haaaaaaayrewugrhyw/multihop-retrieval.git
+%cd multihop-retrieval/experiments/cross_layer_attention
+!python train.py --sweep --dataset mnist
 !python train.py --sweep --dataset cifar10
+!python analyze.py --dataset mnist
 !python analyze.py --dataset cifar10
 ```
 
-Then download `results/cifar10_results.jsonl` from the notebook output and run
-`analyze.py` locally, or just read the printed table.
+The full sweep is 5 variants x 5 sizes x 3 seeds = 75 runs per dataset.
+CIFAR-10 full-data tier dominates the runtime (~2-3h on a T4). If a session
+is tight, drop to 2 seeds by editing `run_sweep(... seeds=(0,1))`, or run the
+two datasets in separate sessions.
+
+Read results from the printed `analyze.py` table, or download
+`results/<dataset>_results.jsonl` from the notebook's Output tab.
