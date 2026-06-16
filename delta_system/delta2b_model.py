@@ -186,8 +186,9 @@ def main():
     print(f"PULL(content) vs gate(inv) gradient cosine = {cos_ci:+.3f}  "
           f"(<0 = conflicting => PCGrad needed; >=0 = cooperative)")
     print("SANITY: rtd_acc up, content_cos up, sep(edit/syn)>1 => architecture + objectives learn.")
+    w = torch.exp(-log_vars).detach()
     print("learned uncertainty weights exp(-log_var):",
-          {names[i]: round(float(torch.exp(-log_vars[i])), 2) for i in range(5)})
+          {names[i]: round(float(w[i]), 2) for i in range(5)})
     print("=" * 80)
 
 
