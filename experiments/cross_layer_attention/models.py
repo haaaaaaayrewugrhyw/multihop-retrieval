@@ -189,3 +189,64 @@ class HierNet(nn.Module):
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# --------------------------------------------------------------------------- #
+# Plain MLP and MLP + cross-layer (depth-axis) attention.
+# Used by arch_compare.py for the CNN vs ANN vs ANN+attention experiment.
+# An "ANN" here = fully-connected net with NO spatial/convolutional prior, so
+# it is the clean canvas for testing whether forcing the hierarchy helps.
+# --------------------------------------------------------------------------- #
+class MLP(nn.Module):
+    """Plain fully-connected net. Flattens the image itself."""
+
+    def __init__(self, in_dim, n_classes, width=256, depth=4):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        d = in_dim
+        for _ in range(depth):
+            self.layers.append(nn.Sequential(
+                nn.Linear(d, width), nn.LayerNorm(width), nn.ReLU()))
+            d = width
+        self.head = nn.Linear(width, n_classes)
+
+    def forward(self, x):
+        h = x.flatten(1)
+        for layer in self.layers:
+            h = layer(h)
+        return self.head(h)
+
+
+class MLPAttn(nn.Module):
+    """The idea applied to an MLP: each hidden layer (l>=1) attends over the
+    activation vectors of ALL previous hidden layers (tokens = layers), then
+    gates itself. Direct analog of CNN variant B along the MLP depth axis."""
+
+    def __init__(self, in_dim, n_classes, width=256, depth=4, d=32):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        dd = in_dim
+        for _ in range(depth):
+            self.layers.append(nn.Sequential(
+                nn.Linear(dd, width), nn.LayerNorm(width), nn.ReLU()))
+            dd = width
+        # all hidden activations are width-dim, so q/k/v share one shape
+        self.q = nn.ModuleList([nn.Linear(width, d) for _ in range(depth)])
+        self.k = nn.ModuleList([nn.Linear(width, d) for _ in range(depth)])
+        self.v = nn.ModuleList([nn.Linear(width, d) for _ in range(depth)])
+        self.gate = nn.ModuleList([nn.Linear(d, width) for _ in range(depth)])
+        self.head = nn.Linear(width, n_classes)
+
+    def forward(self, x):
+        h = x.flatten(1)
+        hs = []
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if i >= 1:
+                q = self.q[i](h).unsqueeze(1)                       # B, 1, d
+                k = torch.stack([self.k[i](p) for p in hs], dim=1)  # B, L, d
+                v = torch.stack([self.v[i](p) for p in hs], dim=1)  # B, L, d
+                ctx = attend(q, k, v).squeeze(1)                    # B, d
+                h = h * torch.sigmoid(self.gate[i](ctx))           # B, width
+            hs.append(h)
+        return self.head(h)
