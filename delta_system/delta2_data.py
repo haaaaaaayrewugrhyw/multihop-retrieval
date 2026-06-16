@@ -192,36 +192,65 @@ def load_iterater_by_meaning(n, meaning=True, cache=True):
 
 
 def load_wikiatomic_insertions(n, cache=True):
-    """WikiAtomicEdits English insertions (Yin et al. 2019's NL dataset), streamed directly from
-    Google Cloud Storage (bypasses the broken HF loader). TSV cols: base_sentence, phrase,
-    edited_sentence. A = base, B = edited (B = A + inserted phrase). Returns {A, B, phrase, group}."""
-    import gzip
-    import urllib.request
+    """WikiAtomicEdits English insertions (Yin et al. 2019's NL dataset). Robust loader: tries the
+    HuggingFace parquet export (streaming -- reliable on Kaggle) first, then the GCS .tsv.gz as a
+    fallback. A=base_sentence, B=edited_sentence (B = A + inserted phrase). {A, B, phrase, group}."""
     fp = _cache_dir() / f"wae_ins_{n}.pkl"
     if cache and fp.exists():
         print(f"  [cache] wiki_atomic_edits <- {fp}")
         return pickle.load(open(fp, "rb"))
-    url = "https://storage.googleapis.com/wiki-atomic-edits/english/insertions.tsv.gz"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    def keep(base, phrase, edited, out):
+        base, phrase, edited = base.strip(), phrase.strip(), edited.strip()
+        if len(base) < 20 or len(edited) <= len(base) or not phrase:
+            return
+        out.append({"A": base, "B": edited, "phrase": phrase, "group": f"wae{len(out)}"})
+
     out = []
-    with urllib.request.urlopen(req) as resp, gzip.GzipFile(fileobj=resp) as gz:
-        gz.readline()                                  # skip header
-        idx = 0
-        for raw in gz:
-            idx += 1
+    # Method 1: HuggingFace parquet export (streaming)
+    try:
+        from datasets import load_dataset
+        ds = None
+        for kw in ({}, {"trust_remote_code": True}):
             try:
-                parts = raw.decode("utf-8").rstrip("\n").split("\t")
-            except Exception:
-                continue
-            if len(parts) < 3:
-                continue
-            base, phrase, edited = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            if len(base) < 20 or len(edited) <= len(base) or not phrase:
-                continue
-            out.append({"A": base, "B": edited, "phrase": phrase, "group": f"wae{idx}"})
-            if len(out) >= n:
+                ds = load_dataset("google-research-datasets/wiki_atomic_edits",
+                                  "english_insertions", split="train", streaming=True, **kw)
                 break
-    print(f"  loaded {len(out)} WikiAtomicEdits insertions")
+            except TypeError:
+                continue
+        if ds is not None:
+            for ex in ds:
+                keep(ex.get("base_sentence") or "", ex.get("phrase") or "",
+                     ex.get("edited_sentence") or "", out)
+                if len(out) >= n:
+                    break
+            print(f"  loaded {len(out)} WikiAtomicEdits via HF streaming")
+    except Exception as e:
+        print(f"  HF streaming failed ({e}); trying GCS...")
+
+    # Method 2: GCS .tsv.gz fallback
+    if len(out) < min(n, 50):
+        import gzip
+        import urllib.request
+        url = "https://storage.googleapis.com/wiki-atomic-edits/english/insertions.tsv.gz"
+        try:
+            with urllib.request.urlopen(url) as resp, gzip.GzipFile(fileobj=resp) as gz:
+                gz.readline()
+                for raw in gz:
+                    try:
+                        p = raw.decode("utf-8").rstrip("\n").split("\t")
+                    except Exception:
+                        continue
+                    if len(p) >= 3:
+                        keep(p[0], p[1], p[2], out)
+                        if len(out) >= n:
+                            break
+            print(f"  loaded {len(out)} WikiAtomicEdits via GCS")
+        except Exception as e:
+            print(f"  GCS failed ({e})")
+
+    if not out:
+        raise RuntimeError("Could not load WikiAtomicEdits (HF parquet + GCS both failed).")
     if cache:
         pickle.dump(out, open(fp, "wb"))
     return out
