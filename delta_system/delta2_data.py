@@ -192,43 +192,43 @@ def load_iterater_by_meaning(n, meaning=True, cache=True):
 
 
 def load_wikiatomic_insertions(n, cache=True):
-    """WikiAtomicEdits English insertions (Yin et al. 2019's NL dataset). Robust loader: tries the
-    HuggingFace parquet export (streaming -- reliable on Kaggle) first, then the GCS .tsv.gz as a
-    fallback. A=base_sentence, B=edited_sentence (B = A + inserted phrase). {A, B, phrase, group}."""
+    """WikiAtomicEdits English insertions (Yin et al. 2019's NL dataset). The original Google Cloud
+    Storage bucket is no longer public (anonymous access revoked) and there is no HF parquet export,
+    so we load the researcher mirror `jvamvas/peer_wiki-atomic-sample` -- Yin's exact before/after
+    token lists (English). We keep only PURE insertions (src_tag has 'insert' and no 'delete').
+    A=join(src), B=join(tgt), phrase=join(changed). {A, B, phrase, group}."""
     fp = _cache_dir() / f"wae_ins_{n}.pkl"
     if cache and fp.exists():
         print(f"  [cache] wiki_atomic_edits <- {fp}")
         return pickle.load(open(fp, "rb"))
 
-    def keep(base, phrase, edited, out):
-        base, phrase, edited = base.strip(), phrase.strip(), edited.strip()
-        if len(base) < 20 or len(edited) <= len(base) or not phrase:
+    def keep(A, B, phrase, out):
+        A, B, phrase = A.strip(), B.strip(), phrase.strip()
+        if len(A) < 20 or len(B) <= len(A) or not phrase:
             return
-        out.append({"A": base, "B": edited, "phrase": phrase, "group": f"wae{len(out)}"})
+        out.append({"A": A, "B": B, "phrase": phrase, "group": f"wae{len(out)}"})
 
     out = []
-    # Method 1: HuggingFace parquet export (streaming)
+    # Method 1: jvamvas/peer_wiki-atomic-sample (Yin's English data; original GCS bucket is dead)
     try:
         from datasets import load_dataset
-        ds = None
-        for kw in ({}, {"trust_remote_code": True}):
-            try:
-                ds = load_dataset("google-research-datasets/wiki_atomic_edits",
-                                  "english_insertions", split="train", streaming=True, **kw)
+        for split in ("train", "validation", "test"):
+            if len(out) >= n:
                 break
-            except TypeError:
-                continue
-        if ds is not None:
+            ds = load_dataset("jvamvas/peer_wiki-atomic-sample", split=split, streaming=True)
             for ex in ds:
-                keep(ex.get("base_sentence") or "", ex.get("phrase") or "",
-                     ex.get("edited_sentence") or "", out)
+                ops = ex.get("src_tag") or []
+                if "insert" not in ops or "delete" in ops:        # pure insertions only
+                    continue
+                keep(" ".join(ex.get("src") or []), " ".join(ex.get("tgt") or []),
+                     " ".join(ex.get("changed") or []), out)
                 if len(out) >= n:
                     break
-            print(f"  loaded {len(out)} WikiAtomicEdits via HF streaming")
+        print(f"  loaded {len(out)} WikiAtomicEdits insertions (jvamvas mirror)")
     except Exception as e:
-        print(f"  HF streaming failed ({e}); trying GCS...")
+        print(f"  HF mirror failed ({e}); trying GCS...")
 
-    # Method 2: GCS .tsv.gz fallback
+    # Method 2: original GCS .tsv.gz (public access revoked -- kept only as a fallback)
     if len(out) < min(n, 50):
         import gzip
         import urllib.request
@@ -242,7 +242,7 @@ def load_wikiatomic_insertions(n, cache=True):
                     except Exception:
                         continue
                     if len(p) >= 3:
-                        keep(p[0], p[1], p[2], out)
+                        keep(p[0], p[2], p[1], out)               # cols: base, phrase, edited
                         if len(out) >= n:
                             break
             print(f"  loaded {len(out)} WikiAtomicEdits via GCS")
@@ -250,7 +250,7 @@ def load_wikiatomic_insertions(n, cache=True):
             print(f"  GCS failed ({e})")
 
     if not out:
-        raise RuntimeError("Could not load WikiAtomicEdits (HF parquet + GCS both failed).")
+        raise RuntimeError("Could not load WikiAtomicEdits (HF mirror + GCS both failed).")
     if cache:
         pickle.dump(out, open(fp, "wb"))
     return out
