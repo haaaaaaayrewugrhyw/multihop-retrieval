@@ -56,6 +56,17 @@ def content_pred(model, E):                       # routed by PREDICTED gate (re
 
 
 @torch.no_grad()
+def content_truemask(model, E, M):                # routed by the TRUE difflib mask (isolates delta from gate)
+    out, n = [], E["H_A"].size(0)
+    for i in range(0, n, 64):
+        idx = torch.arange(i, min(i + 64, n), device=DEVICE)
+        H_A, A_m, H_B, B_m = take(E, idx)
+        de = model.delta(H_A, A_m, H_B, B_m)
+        out.append(routed_content(de, M[idx], B_m).cpu().numpy())
+    return np.concatenate(out)
+
+
+@torch.no_grad()
 def comp_content(E):                              # fixed complement (the 0.76 baseline)
     out, n = [], E["H_A"].size(0)
     for i in range(0, n, 64):
@@ -144,6 +155,7 @@ def run_seed(seed, tok, d):
     # 1 content retrieval
     g = gold_te.cpu().numpy()
     m_top, _, m_corr = retr(content_pred(model, E_te), g)
+    mt_top, _, _ = retr(content_truemask(model, E_te, M_te), g)   # delta with TRUE mask (gate isolated)
     c_top, _, _ = retr(comp_content(E_te), g)
     e_top, _, _ = retr(enc_b(E_te), g)
     o_top, _, _ = retr(g, g)
@@ -180,7 +192,7 @@ def run_seed(seed, tok, d):
     gated = sc_e >= thr
     e2e = (gated & m_corr).mean()
 
-    return dict(m_top=m_top, c_top=c_top, e_top=e_top, o_top=o_top, per=per,
+    return dict(m_top=m_top, mt_top=mt_top, c_top=c_top, e_top=e_top, o_top=o_top, per=per,
                 auc=auc, sh_top=sh_top, drop=m_top - sh_top, aleak=aleak, e2e=e2e,
                 n_te=len(te_e))
 
@@ -206,8 +218,8 @@ def main():
 
     print(f"\nheld-out test edits ~{res[0]['n_te']} | seeds {args.seeds}\n")
     print("[1] content retrieval top1 (vs baselines):")
-    for k, label in [("m_top", "model (learned)"), ("c_top", "complement 0.76"),
-                     ("e_top", "encB"), ("o_top", "oracle")]:
+    for k, label in [("m_top", "model (pred gate)"), ("mt_top", "model (TRUE mask)"),
+                     ("c_top", "complement 0.76"), ("e_top", "encB"), ("o_top", "oracle")]:
         mu, sd = ms(k); print(f"    {label:<18} {mu:.3f} +/- {sd:.3f}")
     print("    per-type (model):", {ct: round(np.mean([r['per'].get(ct, np.nan) for r in res]), 2) for ct in TYPES})
 
