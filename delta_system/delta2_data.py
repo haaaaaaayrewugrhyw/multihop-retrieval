@@ -191,6 +191,42 @@ def load_iterater_by_meaning(n, meaning=True, cache=True):
     return out
 
 
+def load_wikiatomic_insertions(n, cache=True):
+    """WikiAtomicEdits English insertions (Yin et al. 2019's NL dataset), streamed directly from
+    Google Cloud Storage (bypasses the broken HF loader). TSV cols: base_sentence, phrase,
+    edited_sentence. A = base, B = edited (B = A + inserted phrase). Returns {A, B, phrase, group}."""
+    import gzip
+    import urllib.request
+    fp = _cache_dir() / f"wae_ins_{n}.pkl"
+    if cache and fp.exists():
+        print(f"  [cache] wiki_atomic_edits <- {fp}")
+        return pickle.load(open(fp, "rb"))
+    url = "https://storage.googleapis.com/wiki-atomic-edits/english/insertions.tsv.gz"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    out = []
+    with urllib.request.urlopen(req) as resp, gzip.GzipFile(fileobj=resp) as gz:
+        gz.readline()                                  # skip header
+        idx = 0
+        for raw in gz:
+            idx += 1
+            try:
+                parts = raw.decode("utf-8").rstrip("\n").split("\t")
+            except Exception:
+                continue
+            if len(parts) < 3:
+                continue
+            base, phrase, edited = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if len(base) < 20 or len(edited) <= len(base) or not phrase:
+                continue
+            out.append({"A": base, "B": edited, "phrase": phrase, "group": f"wae{idx}"})
+            if len(out) >= n:
+                break
+    print(f"  loaded {len(out)} WikiAtomicEdits insertions")
+    if cache:
+        pickle.dump(out, open(fp, "wb"))
+    return out
+
+
 def load_paraphrases(n):
     """MRPC paraphrase pairs (label=1) across ALL splits as raw candidates (validated
     separately). MRPC's notion of 'equivalent' is loose (asymmetric add/drop clauses), so the
