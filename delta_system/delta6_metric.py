@@ -210,6 +210,43 @@ def get_ours_reps(target, E_tr, E_te, steps, bs):
     return R_tr, R_te, obj
 
 
+def get_ours_direct_reps(E_tr, E_te, steps, bs, dbs=64, temp=0.07):
+    """Train the delta block DIRECTLY end-to-end on Yin's edit data (contrastive InfoNCE: pooled delta
+    -> its own phrase embedding), with NO autoregressive decoder to hide behind. All gradient pressure
+    lands on the block: it must put the content in the delta or the loss can't drop. We extract the RAW
+    pooled delta (pre-head) and probe it like every other rep. Strongest test of 'can the block learn it'."""
+    ds = DeltaSystem(n_slots=0, vib=False, d0_aware=False).to(DEVICE)
+    head = nn.Sequential(nn.Linear(D_MODEL, D_MODEL), nn.GELU(), nn.Linear(D_MODEL, D_MODEL)).to(DEVICE)
+    params = [p for n, p in ds.named_parameters() if not n.startswith("bert.") and p.requires_grad]
+    params += list(head.parameters())
+    opt = torch.optim.Adam(params, lr=1e-4)
+    rng = np.random.default_rng(0); N = E_tr["H_A"].size(0)
+    ds.train(); head.train()
+    for step in range(1, steps + 1):
+        idx = torch.as_tensor(rng.integers(0, N, dbs), device=DEVICE); b = take(E_tr, idx)
+        delta, _d0, _ = ds.generate_delta(b["H_A"], b["A_m"], b["H_B"], b["B_m"])
+        dvec = _pool(delta, b["nov"], b["B_m"].float())
+        z = F.normalize(head(dvec), dim=-1)
+        e = F.normalize(b["e_phrase"], dim=-1)
+        logits = z @ e.T / temp                                         # in-batch retrieval
+        loss = F.cross_entropy(logits, torch.arange(dbs, device=DEVICE))
+        opt.zero_grad(); loss.backward(); opt.step()
+        if step % 600 == 0:
+            print(f"    ours_direct step {step:>4} | loss {loss.item():.3f}")
+
+    @torch.no_grad()
+    def extract(E):
+        ds.eval(); reps = []
+        for i in range(0, E["H_A"].size(0), 32):
+            idx = torch.arange(i, min(i + 32, E["H_A"].size(0)), device=DEVICE); b = take(E, idx)
+            delta, _d0, _ = ds.generate_delta(b["H_A"], b["A_m"], b["H_B"], b["B_m"])
+            reps.append(_pool(delta, b["nov"], b["B_m"].float()))
+        return torch.cat(reps)
+    R_tr, R_te = extract(E_tr), extract(E_te)
+    del ds, head, opt; gc.collect(); torch.cuda.empty_cache()
+    return R_tr, R_te
+
+
 # ───────────────────────── YIN: diff-aligned edit encoder + copy decoder ─────────────────────────
 class YinEdit(nn.Module):
     def __init__(self):
@@ -366,6 +403,9 @@ def main():
     print("training ours_sent (predict inserted phrase) ...")
     R_tr, R_te, objm["ours_sent"] = get_ours_reps("P", E_tr, E_te, args.steps, args.bs)
     reps["ours_sent"] = (R_tr, R_te)
+    print("training ours_direct (delta block end-to-end, contrastive to phrase -- NO decoder) ...")
+    R_tr, R_te = get_ours_direct_reps(E_tr, E_te, args.steps, args.bs)
+    reps["ours_direct"] = (R_tr, R_te)
     if not args.skip_yin:
         try:
             print("training yin (diff-aligned edit encoder + copy decoder, regenerate B) ...")
@@ -386,7 +426,7 @@ def main():
     print("=" * 100)
 
     order = ["chance", "meandiff", "encB", "fixed_novelB", "oracle",
-             "ours_recon", "ours_sent", "yin"]
+             "ours_recon", "ours_sent", "ours_direct", "yin"]
     print("\n" + "=" * 100)
     print(f"{'approach':<14}{'test_top1':>10}{'MRR':>8}{'train_top1':>12}{'gen_gap':>9}"
           f"{'selectiv':>10}{'cond(>A)':>10}")
