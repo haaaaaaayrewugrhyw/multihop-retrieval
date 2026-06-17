@@ -155,6 +155,27 @@ def _decode_logits(ds, memory, mem_pad, T_ids, T_m):
     return ds.dr_lm(out)
 
 
+@torch.no_grad()
+def ours_objacc(ds, E, target, bs=32):
+    """teacher-forced token accuracy on OURS's own objective -> (overall, novel-only)."""
+    Tid, Tm = ("B_ids", "B_m") if target == "B" else ("P_ids", "P_m")
+    ds.eval(); ov = ovn = nv = nvn = 0.0
+    for i in range(0, E["H_A"].size(0), bs):
+        idx = torch.arange(i, min(i + bs, E["H_A"].size(0)), device=DEVICE); b = take(E, idx)
+        delta, _d0, _ = ds.generate_delta(b["H_A"], b["A_m"], b["H_B"], b["B_m"])
+        denc = ds.dr_delta_enc(delta, src_key_padding_mask=~b["B_m"].bool())
+        memory = torch.cat([b["H_A"], denc], 1)
+        mem_pad = ~torch.cat([b["A_m"], b["B_m"]], 1).bool()
+        pred = _decode_logits(ds, memory, mem_pad, b[Tid], b[Tm]).argmax(-1)
+        m = b[Tm].bool() & (b[Tid] != BOS_ID) & (b[Tid] != SEP_ID)
+        ov += ((pred == b[Tid]) & m).sum().item(); ovn += m.sum().item()
+        if target == "B":
+            mn = m & (b["nov"] > 0.5)
+            nv += ((pred == b[Tid]) & mn).sum().item(); nvn += mn.sum().item()
+    overall = ov / max(ovn, 1)
+    return overall, (nv / max(nvn, 1) if target == "B" else overall)
+
+
 def get_ours_reps(target, E_tr, E_te, steps, bs):
     """target='B' (regenerate B) or 'P' (predict the inserted phrase). Returns pooled-delta reps."""
     ds = DeltaSystem(n_slots=0, vib=False, d0_aware=False).to(DEVICE)
@@ -184,8 +205,9 @@ def get_ours_reps(target, E_tr, E_te, steps, bs):
             reps.append(_pool(delta, b["nov"], b["B_m"].float()))
         return torch.cat(reps)
     R_tr, R_te = extract(E_tr), extract(E_te)
+    obj = {"train": ours_objacc(ds, E_tr, target), "test": ours_objacc(ds, E_te, target)}
     del ds, opt; gc.collect(); torch.cuda.empty_cache()
-    return R_tr, R_te
+    return R_tr, R_te, obj
 
 
 # ───────────────────────── YIN: diff-aligned edit encoder + copy decoder ─────────────────────────
@@ -201,6 +223,31 @@ class YinEdit(nn.Module):
         x = word_emb(al_tok) + self.tag_emb(al_tag)
         h = self.enc(x, src_key_padding_mask=~al_m.bool())
         return self.proj(_pool(h, al_m, al_m))          # [b,d] edit vector f_delta
+
+
+@torch.no_grad()
+def yin_objacc(ds, yin, cph, E, bs=32):
+    """teacher-forced token accuracy on YIN's reconstruction objective -> (overall, novel-only)."""
+    ds.eval(); yin.eval(); cph.eval(); ov = ovn = nv = nvn = 0.0
+    for i in range(0, E["H_A"].size(0), bs):
+        idx = torch.arange(i, min(i + bs, E["H_A"].size(0)), device=DEVICE); b = take(E, idx)
+        f = yin(ds.dr_word_emb, b["al_tok"], b["al_tag"], b["al_m"])
+        memory = torch.cat([b["H_A"], f.unsqueeze(1)], 1)
+        mem_pad = ~torch.cat([b["A_m"], torch.ones(b["A_m"].size(0), 1, device=DEVICE)], 1).bool()
+        B_ids, B_m = b["B_ids"], b["B_m"]; bb, T = B_ids.shape
+        shifted = torch.full((bb, T), BOS_ID, dtype=B_ids.dtype, device=DEVICE); shifted[:, 1:] = B_ids[:, :-1]
+        tgt = ds.dr_word_emb(shifted) + ds.dr_pos(torch.arange(T, device=DEVICE).unsqueeze(0))
+        causal = nn.Transformer.generate_square_subsequent_mask(T, device=DEVICE).bool()
+        dec = ds.dr_decoder(tgt, memory, tgt_mask=causal, tgt_key_padding_mask=~B_m.bool(),
+                            memory_key_padding_mask=mem_pad)
+        cmask = b["A_m"].bool() & (b["A_ids"] != CLS_ID) & (b["A_ids"] != SEP_ID)
+        P, _ = cph(dec, ds.dr_lm(dec), b["H_A"], b["A_ids"], cmask)
+        pred = P.argmax(-1)
+        m = B_m.bool() & (B_ids != BOS_ID) & (B_ids != SEP_ID)
+        ov += ((pred == B_ids) & m).sum().item(); ovn += m.sum().item()
+        mn = m & (b["nov"] > 0.5)
+        nv += ((pred == B_ids) & mn).sum().item(); nvn += mn.sum().item()
+    return ov / max(ovn, 1), nv / max(nvn, 1)
 
 
 def get_yin_reps(E_tr, E_te, steps, bs):
@@ -240,8 +287,9 @@ def get_yin_reps(E_tr, E_te, steps, bs):
             reps.append(yin(ds.dr_word_emb, b["al_tok"], b["al_tag"], b["al_m"]))
         return torch.cat(reps)
     R_tr, R_te = extract(E_tr), extract(E_te)
+    obj = {"train": yin_objacc(ds, yin, cph, E_tr), "test": yin_objacc(ds, yin, cph, E_te)}
     del ds, yin, cph, opt; gc.collect(); torch.cuda.empty_cache()
-    return R_tr, R_te
+    return R_tr, R_te, obj
 
 
 # ───────────────────────── the metric: linear probe + retrieval ─────────────────────────
@@ -308,20 +356,34 @@ def main():
     Etgt_tr, Etgt_te = E_tr["e_phrase"], E_te["e_phrase"]
     del ds0; gc.collect(); torch.cuda.empty_cache()
 
-    reps = {}
+    reps = {}; objm = {}
     z_tr, z_te = zero_reps(E_tr), zero_reps(E_te)
     for k in z_tr:
         reps[k] = (z_tr[k], z_te[k])
     print("\ntraining ours_recon (regenerate B) ...")
-    reps["ours_recon"] = get_ours_reps("B", E_tr, E_te, args.steps, args.bs)
+    R_tr, R_te, objm["ours_recon"] = get_ours_reps("B", E_tr, E_te, args.steps, args.bs)
+    reps["ours_recon"] = (R_tr, R_te)
     print("training ours_sent (predict inserted phrase) ...")
-    reps["ours_sent"] = get_ours_reps("P", E_tr, E_te, args.steps, args.bs)
+    R_tr, R_te, objm["ours_sent"] = get_ours_reps("P", E_tr, E_te, args.steps, args.bs)
+    reps["ours_sent"] = (R_tr, R_te)
     if not args.skip_yin:
         try:
             print("training yin (diff-aligned edit encoder + copy decoder, regenerate B) ...")
-            reps["yin"] = get_yin_reps(E_tr, E_te, args.steps, args.bs)
+            R_tr, R_te, objm["yin"] = get_yin_reps(E_tr, E_te, args.steps, args.bs)
+            reps["yin"] = (R_tr, R_te)
         except Exception as e:
             print(f"  yin failed ({e}); continuing without it")
+
+    print("\n" + "=" * 100)
+    print("ON-OBJECTIVE held-out token accuracy (does each model do ITS OWN job?)   overall | novel-only")
+    print("-" * 100)
+    print(f"{'model':<12}{'objective':<16}{'train_ov':>9}{'train_nov':>11}{'test_ov':>9}{'test_nov':>11}")
+    for name, lab in [("ours_recon", "regen B"), ("ours_sent", "predict phrase"), ("yin", "regen B + copy")]:
+        if name in objm:
+            o = objm[name]
+            print(f"{name:<12}{lab:<16}{o['train'][0]:>9.3f}{o['train'][1]:>11.3f}"
+                  f"{o['test'][0]:>9.3f}{o['test'][1]:>11.3f}")
+    print("=" * 100)
 
     order = ["chance", "meandiff", "encB", "fixed_novelB", "oracle",
              "ours_recon", "ours_sent", "yin"]
