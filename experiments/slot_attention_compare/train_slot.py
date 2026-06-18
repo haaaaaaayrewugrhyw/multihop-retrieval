@@ -156,11 +156,11 @@ def main():
             models[name] = m
             print("  ->", rec)
         print("\n=== RESULT ===")
-        print(f"{'model':<8}{'fg_ari':>10}{'recon_mse':>12}{'params':>10}")
+        print(f"{'model':<8}{'hard':>6}{'fg_ari':>10}{'recon_mse':>12}{'params':>10}")
         for line in open(os.path.join(RESULTS_DIR, "slot_results.jsonl")):
             r = json.loads(line)
-            print(f"{r['model']:<8}{r['fg_ari']:>10.4f}{r['recon_mse']:>12.6f}"
-                  f"{r['n_params']:>10,}")
+            print(f"{r['model']:<8}{str(r.get('hard', False)):>6}"
+                  f"{r['fg_ari']:>10.4f}{r['recon_mse']:>12.6f}{r['n_params']:>10,}")
         save_viz(models)
     else:
         train(args.model, args.epochs, hard=args.hard)
