@@ -22,7 +22,10 @@ def _shape_mask(shape, H, W, cx, cy, size, rng):
     return (yy >= cy - size) & (yy <= cy + size) & (np.abs(xx - cx) <= half)
 
 
-def make_dataset(n, H=64, W=64, min_obj=2, max_obj=3, seed=0):
+def make_dataset(n, H=64, W=64, min_obj=2, max_obj=3, seed=0, same_color=False):
+    """same_color=True -> all objects in an image share one color, so they can
+    only be separated by shape/position. Stresses the binding mechanism (color
+    can no longer shortcut object discovery)."""
     rng = np.random.RandomState(seed)
     shapes = ["circle", "square", "triangle"]
     palette = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1],
@@ -31,9 +34,10 @@ def make_dataset(n, H=64, W=64, min_obj=2, max_obj=3, seed=0):
     masks = np.zeros((n, H, W), dtype=np.int64)
     for i in range(n):
         k = rng.randint(min_obj, max_obj + 1)
+        img_color = palette[rng.randint(len(palette))]   # used if same_color
         for o in range(1, k + 1):
             shape = shapes[rng.randint(len(shapes))]
-            color = palette[rng.randint(len(palette))]
+            color = img_color if same_color else palette[rng.randint(len(palette))]
             size = rng.randint(7, 12)
             cx = rng.randint(size, W - size)
             cy = rng.randint(size, H - size)

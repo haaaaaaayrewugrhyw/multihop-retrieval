@@ -62,17 +62,19 @@ def evaluate(model, imgs, masks, batch=64):
     return mse_tot / n, float(np.mean(aris))
 
 
-def train(model_name, epochs, n_train=5000, n_test=512, batch=32, lr=4e-4,
-          num_slots=4, iters=3, seed=0, warmup=300):
+def train(model_name, epochs, hard=False, n_train=5000, n_test=512, batch=32,
+          lr=4e-4, num_slots=4, iters=3, seed=0, warmup=1500):
     set_seed(seed)
     competition = (model_name == "slot")
     model = SlotAE(num_slots=num_slots, iters=iters,
                    competition=competition).to(DEVICE)
     n_params = count_params(model)
-    tr_imgs, tr_masks = make_dataset(n_train, seed=seed)
-    te_imgs, te_masks = make_dataset(n_test, seed=999)
+    tr_imgs, tr_masks = make_dataset(n_train, seed=seed, same_color=hard)
+    te_imgs, te_masks = make_dataset(n_test, seed=999, same_color=hard)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
+    steps_per_epoch = (n_train + batch - 1) // batch
+    total_steps = epochs * steps_per_epoch
     step, t0 = 0, time.time()
     for ep in range(epochs):
         model.train()
@@ -84,18 +86,23 @@ def train(model_name, epochs, n_train=5000, n_test=512, batch=32, lr=4e-4,
             loss = F.mse_loss(recon, x)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if step < warmup:                       # linear lr warmup (stability)
-                for g in opt.param_groups:
-                    g["lr"] = lr * (step + 1) / warmup
+            # linear warmup then cosine decay (slot attn is sensitive to this)
+            if step < warmup:
+                cur = lr * (step + 1) / warmup
+            else:
+                prog = (step - warmup) / max(1, total_steps - warmup)
+                cur = 0.5 * lr * (1 + np.cos(np.pi * prog))
+            for g in opt.param_groups:
+                g["lr"] = cur
             opt.step(); step += 1
         if ep % 5 == 0 or ep == epochs - 1:
             mse, ari = evaluate(model, te_imgs, te_masks)
             print(f"  [{model_name}] ep {ep:>3} loss {loss.item():.4f} "
                   f"test_mse {mse:.5f} fg_ari {ari:.4f} ({time.time()-t0:.0f}s)")
     mse, ari = evaluate(model, te_imgs, te_masks)
-    rec = dict(model=model_name, epochs=epochs, recon_mse=round(mse, 6),
-               fg_ari=round(ari, 4), n_params=n_params,
-               sec=round(time.time() - t0, 1))
+    rec = dict(model=model_name, epochs=epochs, hard=hard,
+               recon_mse=round(mse, 6), fg_ari=round(ari, 4),
+               n_params=n_params, sec=round(time.time() - t0, 1))
     with open(os.path.join(RESULTS_DIR, "slot_results.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     return model, rec
@@ -135,15 +142,17 @@ def save_viz(models, n=6, seed=999):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=["slot", "plain"], default="slot")
-    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--hard", action="store_true",
+                    help="same-color objects: color can't shortcut binding")
     ap.add_argument("--compare", action="store_true")
     args = ap.parse_args()
-    print(f"device={DEVICE}")
+    print(f"device={DEVICE} hard={args.hard} epochs={args.epochs}")
     if args.compare:
         models = {}
         for name in ["slot", "plain"]:
             print(f"\n=== training {name} ===")
-            m, rec = train(name, args.epochs)
+            m, rec = train(name, args.epochs, hard=args.hard)
             models[name] = m
             print("  ->", rec)
         print("\n=== RESULT ===")
@@ -154,7 +163,7 @@ def main():
                   f"{r['n_params']:>10,}")
         save_viz(models)
     else:
-        train(args.model, args.epochs)
+        train(args.model, args.epochs, hard=args.hard)
 
 
 if __name__ == "__main__":
