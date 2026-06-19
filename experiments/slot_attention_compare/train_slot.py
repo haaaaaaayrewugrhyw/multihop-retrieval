@@ -108,14 +108,14 @@ def train(model_name, epochs, hard=False, n_train=5000, n_test=512, batch=32,
     return model, rec
 
 
-def save_viz(models, n=6, seed=999):
+def save_viz(models, hard=False, n=6, seed=999):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except Exception as e:
         print("skip viz:", e); return
-    imgs, _ = make_dataset(n, seed=seed)
+    imgs, _ = make_dataset(n, seed=seed, same_color=hard)   # match train regime
     x = torch.from_numpy(imgs).to(DEVICE)
     ncols = 1 + len(models) * (1 + 4)        # input + per-model (recon + 4 masks)
     fig, ax = plt.subplots(n, ncols, figsize=(ncols * 1.4, n * 1.4))
@@ -145,25 +145,48 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--hard", action="store_true",
                     help="same-color objects: color can't shortcut binding")
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="number of seeds (0..N-1) per model, for replication")
     ap.add_argument("--compare", action="store_true")
     args = ap.parse_args()
-    print(f"device={DEVICE} hard={args.hard} epochs={args.epochs}")
+    print(f"device={DEVICE} hard={args.hard} epochs={args.epochs} seeds={args.seeds}")
     if args.compare:
         models = {}
         for name in ["slot", "plain"]:
-            print(f"\n=== training {name} ===")
-            m, rec = train(name, args.epochs, hard=args.hard)
-            models[name] = m
-            print("  ->", rec)
-        print("\n=== RESULT ===")
-        print(f"{'model':<8}{'hard':>6}{'fg_ari':>10}{'recon_mse':>12}{'params':>10}")
-        for line in open(os.path.join(RESULTS_DIR, "slot_results.jsonl")):
-            r = json.loads(line)
-            print(f"{r['model']:<8}{str(r.get('hard', False)):>6}"
-                  f"{r['fg_ari']:>10.4f}{r['recon_mse']:>12.6f}{r['n_params']:>10,}")
-        save_viz(models)
+            for seed in range(args.seeds):
+                print(f"\n=== training {name} (seed {seed}, hard={args.hard}) ===")
+                m, rec = train(name, args.epochs, hard=args.hard, seed=seed)
+                models[name] = m                 # keep last seed for viz
+                print("  ->", rec)
+        aggregate_and_print()
+        save_viz(models, hard=args.hard)
     else:
         train(args.model, args.epochs, hard=args.hard)
+
+
+def aggregate_and_print():
+    """Group results by (model, hard) and report mean +/- std over seeds."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: {"ari": [], "mse": []})
+    for line in open(os.path.join(RESULTS_DIR, "slot_results.jsonl")):
+        r = json.loads(line)
+        key = (r["model"], r.get("hard", False))
+        agg[key]["ari"].append(r["fg_ari"])
+        agg[key]["mse"].append(r["recon_mse"])
+
+    def ms(xs):
+        m = sum(xs) / len(xs)
+        sd = (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5 if len(xs) > 1 else 0.0
+        return m, sd
+
+    print("\n=== RESULT (mean +/- std over seeds) ===")
+    print(f"{'model':<8}{'hard':>6}{'n':>3}{'fg_ari':>18}{'recon_mse':>18}")
+    for key in sorted(agg):
+        a_m, a_s = ms(agg[key]["ari"])
+        m_m, m_s = ms(agg[key]["mse"])
+        n = len(agg[key]["ari"])
+        print(f"{key[0]:<8}{str(key[1]):>6}{n:>3}"
+              f"{a_m:>10.4f}+-{a_s:<6.4f}{m_m:>10.5f}+-{m_s:<6.5f}")
 
 
 if __name__ == "__main__":
