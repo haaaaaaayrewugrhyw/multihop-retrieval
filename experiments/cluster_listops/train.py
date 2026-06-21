@@ -48,15 +48,17 @@ def acc_on(model, toks, labels, batch=500):
     return float((torch.cat(preds).numpy() == labels).mean())
 
 
+MODE = {"baseline": "none", "cluster": "implicit", "cluster_bias": "bias"}
+
+
 def run(model_name, seed, train_size=20000, d=128, layers=4, heads=4,
         epochs=40, batch=128):
     set_seed(seed)
-    use_cluster = (model_name == "cluster")
     tr_t, tr_y = make(train_size, TRAIN_DEPTHS, MAX_LEN, seed=seed)
     ti_t, ti_y = make(3000, TRAIN_DEPTHS, MAX_LEN, seed=70001)        # in-dist test
     to_t, to_y = make(3000, OOD_DEPTHS, MAX_LEN, seed=80002)          # OOD test
     model = ListOpsTransformer(VOCAB, d, layers, heads, 10, K=8,
-                               max_len=MAX_LEN, use_cluster=use_cluster).to(DEVICE)
+                               max_len=MAX_LEN, cluster_mode=MODE[model_name]).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     tr_t = torch.tensor(tr_t)
@@ -78,6 +80,9 @@ def run(model_name, seed, train_size=20000, d=128, layers=4, heads=4,
                acc_in=round(acc_on(model, ti_t, ti_y), 4),
                acc_ood=round(acc_on(model, to_t, to_y), 4),
                params=count_params(model), sec=round(time.time() - t0, 1))
+    if hasattr(model, "lam"):
+        rec["lam"] = [round(v, 3) for v in model.lam.detach().cpu().tolist()]
+        print(f"    learned lambda per layer: {rec['lam']}")
     with open(os.path.join(RESULTS, "listops.jsonl"), "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"  {model_name:9s} seed={seed}  in-dist={rec['acc_in']:.4f}  "
@@ -104,17 +109,18 @@ def analyze():
         return m, sd
 
     print(f"\n=== ListOps (train depth {TRAIN_DEPTHS}, OOD depth {OOD_DEPTHS}) ===")
-    print(f"{'model':<9}{'params':>10}{'in-dist':>16}{'OOD':>16}")
-    for m in ("baseline", "cluster"):
+    print(f"{'model':<13}{'params':>10}{'in-dist':>16}{'OOD':>16}")
+    for m in ("baseline", "cluster", "cluster_bias"):
         if m not in agg:
             continue
         im, isd = ms(agg[m]["in"]); om, osd = ms(agg[m]["ood"])
-        print(f"{m:<9}{params[m]:>10,}{im*100:>9.2f}+-{isd*100:<4.1f}"
+        print(f"{m:<13}{params[m]:>10,}{im*100:>9.2f}+-{isd*100:<4.1f}"
               f"{om*100:>9.2f}+-{osd*100:<4.1f}")
-    if "baseline" in agg and "cluster" in agg:
-        d_in = (ms(agg["cluster"]["in"])[0] - ms(agg["baseline"]["in"])[0]) * 100
-        d_ood = (ms(agg["cluster"]["ood"])[0] - ms(agg["baseline"]["ood"])[0]) * 100
-        print(f"\ncluster - baseline:  in-dist {d_in:+.2f} pp   OOD {d_ood:+.2f} pp")
+    for m in ("cluster", "cluster_bias"):
+        if "baseline" in agg and m in agg:
+            d_in = (ms(agg[m]["in"])[0] - ms(agg["baseline"]["in"])[0]) * 100
+            d_ood = (ms(agg[m]["ood"])[0] - ms(agg["baseline"]["ood"])[0]) * 100
+            print(f"\n{m} - baseline:  in-dist {d_in:+.2f} pp   OOD {d_ood:+.2f} pp")
         print("Headline = OOD gap. Positive OOD gap = the structured prior helps "
               "generalize to deeper trees.")
 
@@ -129,7 +135,7 @@ def main():
     seeds = (0,) if args.quick else (0, 1, 2)
     epochs = 15 if args.quick else 40
     print(f"=== device={DEVICE} | seeds={seeds} | epochs={epochs} ===")
-    for m in ("baseline", "cluster"):
+    for m in ("baseline", "cluster_bias"):     # explicit-bias lever vs fresh baseline
         for s in seeds:
             run(m, s, epochs=epochs)
     analyze()
