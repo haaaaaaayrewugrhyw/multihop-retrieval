@@ -33,8 +33,16 @@ os.makedirs(RESULTS, exist_ok=True)
 RESFILE = os.path.join(RESULTS, "deint.jsonl")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CFG = dict(d=128, n_layers=4, heads=4, K=5, L_min=4, L_max=8, S_min=2,
+CFG = dict(d=128, d_wide=168, n_layers=4, heads=4, K=5, L_min=4, L_max=8, S_min=2,
            train_size=20000, epochs=40, batch=128, lr=3e-4)
+
+# what each model tests:
+#   baseline       - plain transformer (capacity reference)
+#   baseline_wide  - plain transformer, param-matched to the EM models
+#   em_fixed       - EM clusters, output reads pooled content (tokens can bypass clusters)
+#   em_frozen      - EM clusters with assignment FROZEN at init (no learned E-step)
+#   em_bottleneck  - PURE BOTTLENECK: output reads ONLY the cluster centers
+ALL_MODELS = ["baseline", "baseline_wide", "em_fixed", "em_frozen", "em_bottleneck"]
 
 
 def set_seed(s):
@@ -45,8 +53,14 @@ def build(name, cfg, max_len, n_classes):
     if name == "baseline":
         return BaselineDeint(VOCAB, cfg["d"], cfg["n_layers"], cfg["heads"],
                              n_classes, max_len, pad_id=PAD)
+    if name == "baseline_wide":
+        return BaselineDeint(VOCAB, cfg["d_wide"], cfg["n_layers"], cfg["heads"],
+                             n_classes, max_len, pad_id=PAD)
     return EMDeint(VOCAB, cfg["d"], cfg["n_layers"], cfg["heads"], cfg["K"],
-                   n_classes, max_len, variable_pos=(name == "em_varpos"), pad_id=PAD)
+                   n_classes, max_len,
+                   variable_pos=(name == "em_varpos"), pad_id=PAD,
+                   readout=("centers" if name == "em_bottleneck" else "pool"),
+                   freeze_P=(name == "em_frozen"))
 
 
 @torch.no_grad()
@@ -154,17 +168,18 @@ def analyze():
         return m, sd
 
     print(f"\n=== de-interleaving (count sources; K={CFG['K']}) ===")
-    print(f"{'model':<11}{'params':>10}{'count-acc':>13}{'src-ARI':>10}{'eff_clu':>9}{'conc':>7}{'nmi':>7}")
-    for m in ("baseline", "em_fixed", "em_varpos"):
+    print(f"{'model':<14}{'params':>10}{'count-acc':>13}{'src-ARI':>10}{'eff_clu':>9}{'conc':>7}{'nmi':>7}")
+    for m in ALL_MODELS + ["em_varpos"]:
         if m not in agg:
             continue
         a = ms(agg[m]["acc"])
         cells = f"{a[0]*100:>8.2f}±{a[1]*100:<3.1f}"
         for kk in ("src_ari", "eff_clu", "conc", "nmi"):
             cells += f"{ms(agg[m][kk])[0]:>{10 if kk=='src_ari' else (9 if kk=='eff_clu' else 7)}.3f}" if agg[m][kk] else f"{'-':>9}"
-        print(f"{m:<11}{params[m]:>10,}{cells}")
-    print("\nRead: high src-ARI = clusters recovered the latent sources (real separation!). "
-          "eff_clu near #sources = bottleneck used.")
+        print(f"{m:<14}{params[m]:>10,}{cells}")
+    print("\nRead: em_bottleneck FORCES the answer through the clusters. If its src-ARI jumps,"
+          "\n      forcing the bottleneck makes clusters separate. If em_fixed beats em_frozen,"
+          "\n      the learned E-step (not just the init) is doing the work.")
 
 
 def smoke(cfg):
@@ -172,12 +187,12 @@ def smoke(cfg):
     t, s, y, ns = make(8, cfg["K"], cfg["L_min"], cfg["L_max"], cfg["S_min"], seed=0)
     print(f"smoke: S={sorted(set(ns.tolist()))}, max_len={ml}, n_classes={ncls}")
     x = torch.tensor(t)
-    for name in ("baseline", "em_fixed", "em_varpos"):
+    for name in ALL_MODELS:
         model = build(name, cfg, ml, ncls)
         out = model(x)
         assert out.shape == (8, ncls), out.shape
         F.cross_entropy(out, torch.tensor(y)).backward()
-        print(f"  {name:11s} out{tuple(out.shape)} params={count_params(model):,} "
+        print(f"  {name:14s} out{tuple(out.shape)} params={count_params(model):,} "
               f"nan={bool(torch.isnan(out).any())}")
     print("  SMOKE OK")
 
@@ -196,9 +211,9 @@ def main():
         analyze(); return
     if args.quick:
         cfg = dict(cfg, epochs=12, train_size=4000)
-        models, seeds = ["baseline", "em_fixed"], [0]
+        models, seeds = ["baseline", "em_fixed", "em_frozen", "em_bottleneck"], [0]
     else:
-        models, seeds = ["baseline", "em_fixed", "em_varpos"], list(range(args.seeds))
+        models, seeds = ALL_MODELS, list(range(args.seeds))
     print(f"=== device={DEVICE} | models={models} | seeds={seeds} | "
           f"d={cfg['d']} L={cfg['n_layers']} K={cfg['K']} ep={cfg['epochs']} ===")
     for m in models:

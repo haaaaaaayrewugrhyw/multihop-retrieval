@@ -44,13 +44,15 @@ class EMLayer(nn.Module):
             self.grup = nn.GRUCell(d, d)
             self.op = nn.Linear(d, d)
 
-    def forward(self, h, p, P, mu, mu_p, pad_mask):
+    def forward(self, h, p, P, mu, mu_p, pad_mask, freeze_P=False):
         B, T, _ = h.shape
         x = torch.cat([self.ln(h), p, P], dim=-1)         # token vector [content|pos|cluster]
 
         # E-step: token-to-center attention -> new cluster probabilities
         attn = (self.q(x) @ self.kc(mu).transpose(1, 2)) * self.scale     # (B,T,K)
         P_new = attn.softmax(dim=-1) * (~pad_mask).unsqueeze(-1).float()   # zero PAD tokens
+        if freeze_P:                                       # ablation: keep the init grouping
+            P_new = P                                      #   (no learned E-step assignment)
 
         # M-step: centers = responsibility-weighted mean of token values
         counts = P_new.sum(1).unsqueeze(-1) + 1e-6                          # (B,K,1)

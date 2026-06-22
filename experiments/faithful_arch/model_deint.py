@@ -69,15 +69,22 @@ class BaselineDeint(nn.Module):
 
 
 class EMDeint(nn.Module):
+    """readout='pool'   : classify pooled per-token content (tokens can bypass clusters)
+       readout='centers': PURE BOTTLENECK -- classify only from the K cluster centers,
+                          so token info reaches the output ONLY through the clusters.
+       freeze_P=True    : ablation -- assignment stays at the neutral init (no learned E-step)."""
+
     def __init__(self, vocab, d, n_layers, heads, K, n_classes, max_len,
-                 variable_pos=False, pad_id=PAD):
+                 variable_pos=False, pad_id=PAD, readout="pool", freeze_P=False):
         super().__init__()
         self.d, self.K, self.max_len, self.pad_id = d, K, max_len, pad_id
-        self.variable_pos = variable_pos
+        self.variable_pos, self.readout, self.freeze_P = variable_pos, readout, freeze_P
         self.collect_P, self._last_P = False, None
         self.tok = nn.Embedding(vocab, d)
         self.pos = nn.Embedding(max_len, d)
         self.layers = nn.ModuleList([EMLayer(d, K, variable_pos) for _ in range(n_layers)])
+        if readout == "centers":
+            self.cluster_mlp = nn.Sequential(nn.Linear(d + 1, d), nn.GELU())
         self.head = nn.Linear(d, n_classes)
 
     def forward(self, tokens):
@@ -94,9 +101,13 @@ class EMDeint(nn.Module):
         mu = (P.transpose(1, 2) @ h) / counts
         mu_p = (P.transpose(1, 2) @ p) / counts if self.variable_pos else None
         for layer in self.layers:
-            h, p, P, mu, mu_p = layer(h, p, P, mu, mu_p, pad)
+            h, p, P, mu, mu_p = layer(h, p, P, mu, mu_p, pad, freeze_P=self.freeze_P)
         if self.collect_P:
             self._last_P = P.detach()
+        if self.readout == "centers":                       # PURE BOTTLENECK: output sees only centers
+            soft_counts = P.sum(1, keepdim=True).transpose(1, 2)         # (B,K,1)
+            feat = self.cluster_mlp(torch.cat([mu, torch.log1p(soft_counts)], dim=-1))
+            return self.head(feat.sum(1))                   # sum over clusters (count-sensitive)
         return self.head((h * not_pad).sum(1) / not_pad.sum(1).clamp(min=1.0))
 
 
