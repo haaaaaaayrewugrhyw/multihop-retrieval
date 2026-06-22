@@ -68,7 +68,7 @@ class TransformerBlock(nn.Module):
 
 class FullArchitecture(nn.Module):
     def __init__(self, vocab, d, n_layers, heads, n_classes, K, max_len,
-                 cluster_mode="none", variable_pos=False, bias_clamp=10.0):
+                 cluster_mode="none", variable_pos=False, bias_clamp=10.0, pad_id=15):
         super().__init__()
         assert cluster_mode in ("none", "full")
         self.cluster_mode = cluster_mode
@@ -76,6 +76,9 @@ class FullArchitecture(nn.Module):
         self.K = K
         self.max_len = max_len
         self.bias_clamp = bias_clamp
+        self.pad_id = pad_id
+        self.collect_P = False          # set True to stash final cluster assignments in _last_P
+        self._last_P = None
 
         self.tok = nn.Embedding(vocab, d)
         self.pos = nn.Embedding(max_len, d)
@@ -91,7 +94,7 @@ class FullArchitecture(nn.Module):
 
     def forward(self, tokens):
         B, T = tokens.shape
-        pad_mask = (tokens == PAD)
+        pad_mask = (tokens == self.pad_id)
         posids = torch.arange(T, device=tokens.device).unsqueeze(0).expand(B, T)
         h = self.tok(tokens)
         p = self.pos(posids)
@@ -116,6 +119,9 @@ class FullArchitecture(nn.Module):
                 c = c + self.h2c[l](h)                         # (4) refine cluster from content
             if self.variable_pos:
                 p = p + self.p2h[l](h)                         # refine position from content
+
+        if self.cluster_mode == "full" and self.collect_P:
+            self._last_P = torch.softmax(c, dim=-1).detach()   # final per-token cluster dist
 
         m = (~pad_mask).float().unsqueeze(-1)                  # masked mean-pool over non-PAD
         pooled = (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
