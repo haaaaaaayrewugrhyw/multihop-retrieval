@@ -104,6 +104,56 @@ def viz(model, t, s, n=4):
         print(f"          clus  {''.join(str(x) for x in pred[i][m].tolist())}")
 
 
+@torch.no_grad()
+def soft_diag(model, t, s, batch=512):
+    """Soft cluster diagnostics (the RIGHT lens, not hard argmax-vs-sentences):
+       eff_clusters = exp(entropy of mean assignment)  -> 1 = collapsed, K = all used
+       concentration = per-sentence max average-P       -> 1 = sentence picks one cluster
+       nmi          = normalized MI(sentence; cluster)  -> 1 = clusters determine sentence
+    """
+    model.eval(); model.collect_P = True
+    xt, st = torch.tensor(t).to(DEVICE), torch.tensor(s).to(DEVICE)
+    Ps = []
+    for i in range(0, len(t), batch):
+        _ = model(xt[i:i + batch], st[i:i + batch])
+        Ps.append(model._last_P.cpu().numpy())
+    P = np.concatenate(Ps, 0)                                  # (N,T,K)
+    eff, conc, nmi = [], [], []
+    for i in range(len(t)):
+        m = s[i] != -1
+        if m.sum() < 2 or len(set(s[i][m].tolist())) < 2:
+            continue
+        Pi, si = P[i][m], s[i][m]
+        mass = Pi.mean(0); mass = mass / (mass.sum() + 1e-9)
+        eff.append(float(np.exp(-(mass * np.log(mass + 1e-9)).sum())))
+        sents = sorted(set(si.tolist()))
+        J = np.stack([Pi[si == c].mean(0) for c in sents])     # (S,K) per-sentence avg dist
+        J = J / (J.sum(1, keepdims=True) + 1e-9)
+        conc.append(float(J.max(1).mean()))
+        Jj = J * np.array([(si == c).sum() for c in sents])[:, None]
+        Jj = Jj / (Jj.sum() + 1e-9)
+        ps, pk = Jj.sum(1, keepdims=True), Jj.sum(0, keepdims=True)
+        mi = (Jj * (np.log(Jj + 1e-12) - np.log(ps + 1e-12) - np.log(pk + 1e-12))).sum()
+        Hs = -(ps * np.log(ps + 1e-12)).sum(); Hk = -(pk * np.log(pk + 1e-12)).sum()
+        nmi.append(float(mi / (min(Hs, Hk) + 1e-9)))
+    return dict(eff_clusters=round(np.mean(eff), 3),
+                concentration=round(np.mean(conc), 3), nmi=round(np.mean(nmi), 3))
+
+
+def soft_viz(model, t, s, n=4):
+    model.eval(); model.collect_P = True
+    with torch.no_grad():
+        _ = model(torch.tensor(t[:n]).to(DEVICE), torch.tensor(s[:n]).to(DEVICE))
+    P = model._last_P.cpu().numpy()
+    print("\n  per-sentence average cluster distribution (cols = clusters 0..K-1):")
+    for i in range(n):
+        m = s[i] != -1
+        print(f"    ex{i}:")
+        for c in sorted(set(s[i][m].tolist())):
+            q = P[i][s[i] == c].mean(0)
+            print(f"      sent {c}: [{' '.join(f'{v:.2f}' for v in q)}]")
+
+
 def run(name, seed, cfg):
     set_seed(seed)
     K, ml = cfg["K"], max_len_for(cfg["K"], cfg["L_max"])
@@ -137,12 +187,14 @@ def run(name, seed, cfg):
                params=count_params(model), sec=round(time.time() - t0, 1))
     if name.startswith("em"):
         rec["ari"] = round(cluster_recovery(model, te_t, te_s), 4)
+        rec.update(soft_diag(model, te_t, te_s))
     with open(RESFILE, "a") as f:
         f.write(json.dumps(rec) + "\n")
-    extra = f"  cluster-ARI={rec['ari']:.3f}" if "ari" in rec else ""
+    extra = (f"  hardARI={rec['ari']:.3f} eff_clu={rec['eff_clusters']}/{cfg['K']} "
+             f"conc={rec['concentration']} nmi={rec['nmi']}") if "ari" in rec else ""
     print(f"  {name:13s} seed={seed} acc={rec['acc']:.3f}{extra}  ({rec['params']:,}p {rec['sec']}s)")
     if name == "em_fixed" and seed == 0:
-        viz(model, te_t, te_s)
+        soft_viz(model, te_t, te_s)
     return rec
 
 
@@ -203,6 +255,7 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--analyze", action="store_true")
     ap.add_argument("--wide", action="store_true")
+    ap.add_argument("--soft", action="store_true")
     ap.add_argument("--seeds", type=int, default=3)
     args = ap.parse_args()
     cfg = dict(CFG)
@@ -210,7 +263,9 @@ def main():
         smoke(cfg); return
     if args.analyze:
         analyze(); return
-    if args.quick:
+    if args.soft:                          # re-run EM models with soft cluster diagnostics
+        models, seeds = ["em_fixed", "em_varpos"], [0, 1]
+    elif args.quick:
         cfg = dict(cfg, epochs=10, train_size=3000)
         models, seeds = ["baseline", "em_fixed"], [0]
     else:
